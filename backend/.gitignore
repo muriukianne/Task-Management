@@ -10,6 +10,7 @@ release.properties
 .project
 .classpath
 .claude/
+.claude/
 .settings/
 bin/
 
