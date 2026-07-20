@@ -1,23 +1,19 @@
 package api.v1.tm.controller;
 
-import org.eclipse.microprofile.jwt.JsonWebToken;
-
 import api.v1.tm.dtos.requests.CreateUserRequest;
-import api.v1.tm.dtos.requests.LoginRequest;
-import api.v1.tm.dtos.responses.ResponseArray;
+import api.v1.tm.dtos.requests.SyncUserRequest;
+import api.v1.tm.dtos.requests.UpdateUserRequest;
+import api.v1.tm.dtos.responses.ApiResponse;
+import api.v1.tm.entity.AppUser;
+import api.v1.tm.security.CurrentAppUser;
 import api.v1.tm.services.UserService;
-import api.v1.tm.utils.ResponseManager;
 import io.quarkus.security.Authenticated;
 import io.smallrye.common.annotation.Blocking;
 import io.smallrye.mutiny.Uni;
-import jakarta.annotation.security.PermitAll;
 import jakarta.validation.Valid;
-import jakarta.ws.rs.Consumes;
-import jakarta.ws.rs.GET;
-import jakarta.ws.rs.POST;
-import jakarta.ws.rs.Path;
-import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -26,43 +22,98 @@ import lombok.extern.slf4j.Slf4j;
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 @RequiredArgsConstructor
-public final class UserController {
+public class UserController {
+
     private final UserService userService;
-    private final JsonWebToken jwt;
-    private final ResponseManager responseManager;
+    private final CurrentAppUser currentAppUser;
 
     @POST
-    @Blocking
     @Path("/create")
+    @Blocking
     @Authenticated
-    public Uni<ResponseArray<?>> createUser(@Valid CreateUserRequest request) {
-        String userId = jwt.getSubject();
-        if (userId == null) {
-            return responseManager.onHandleErrorResponse("Invalid token: Missing subject claim");
-        }
-        log.info("Create user requested by: {}", userId);
-        return this.userService.createUser(request);
+    public Uni<Response> createUser(@Valid CreateUserRequest request) {
+        return userService.createUser(request)
+                .map(created -> Response.status(Response.Status.CREATED)
+                        .entity(ApiResponse.created(created))
+                        .build());
+    }
+
+    /**
+     * Lists all registered application users (used by Assign-To dropdowns).
+     * Canonical path: {@code GET /tm/api/v1/users}
+     */
+    @GET
+    @Blocking
+    @Authenticated
+    public Uni<Response> listUsers() {
+        return userService.getUsers()
+                .map(users -> Response.ok(ApiResponse.success(users)).build());
+    }
+
+    /** Legacy alias kept for older clients. */
+    @GET
+    @Path("/get-users")
+    @Blocking
+    @Authenticated
+    public Uni<Response> getUsers() {
+        return listUsers();
     }
 
     @GET
+    @Path("/{id}")
     @Blocking
-    @Path("/get-users")
     @Authenticated
-    public Uni<ResponseArray<?>> getUsers() {
-        String userId = jwt.getSubject();
-        if (userId == null) {
-            return responseManager.onHandleErrorResponse("Invalid token: Missing subject claim");
-        }
-        log.info("Get users requested by: {}", userId);
-        return this.userService.getUsers();
+    public Uni<Response> getUser(@PathParam("id") Long id) {
+        return userService.getUser(id)
+                .map(user -> Response.ok(ApiResponse.success(user)).build());
     }
 
-    @POST
+    @PUT
+    @Path("/{id}")
     @Blocking
-    @PermitAll
+    @Authenticated
+    public Uni<Response> updateUser(@PathParam("id") Long id, @Valid UpdateUserRequest request) {
+        return userService.updateUser(id, request)
+                .map(user -> Response.ok(ApiResponse.success("User updated", user)).build());
+    }
+
+    @DELETE
+    @Path("/{id}")
+    @Blocking
+    @Authenticated
+    public Uni<Response> deleteUser(@PathParam("id") Long id) {
+        return userService.deleteUser(id)
+                .map(v -> Response.ok(ApiResponse.success("User deleted", null)).build());
+    }
+
+    /**
+     * Silently provisions the authenticated Clerk user into {@code app_users}
+     * if they are missing, then returns the synchronized profile.
+     * Optional body supplies email/name when the JWT template omits those claims.
+     */
+    @POST
+    @Path("/sync")
+    @Blocking
+    @Authenticated
+    public Uni<Response> syncUser(@Valid SyncUserRequest profile) {
+        AppUser user = userService.ensureCurrentUser(profile);
+        currentAppUser.set(user);
+        return Uni.createFrom().item(Response.ok(ApiResponse.success(user)).build());
+    }
+
+    /**
+     * Password-grant login via Supabase has been removed.
+     * Clients must obtain a standard OIDC JWT from the identity provider and
+     * send it as {@code Authorization: Bearer <token>} on API requests.
+     */
+    @POST
     @Path("/login")
-    public Uni<ResponseArray<?>> login(@Valid LoginRequest request) {
-        log.info("Login attempt for: {}", request.getEmail());
-        return this.userService.login(request);
+    @Blocking
+    public Response loginRemoved() {
+        return Response.status(Response.Status.GONE)
+                .entity(ApiResponse.error(410,
+                        "Password login has been removed. Authenticate with your OIDC provider "
+                        + "and send the access token as a Bearer JWT."))
+                .build();
     }
 }

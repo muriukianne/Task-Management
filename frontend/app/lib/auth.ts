@@ -1,24 +1,19 @@
-const TOKEN_KEY = 'tm_token';
+'use client';
 
-export const saveToken = (token: string): void => {
-  localStorage.setItem(TOKEN_KEY, token);
-};
+/**
+ * JWT helpers for Clerk (and other OIDC) access tokens.
+ * Token storage is owned by Clerk — do not use localStorage for auth tokens.
+ */
 
-export const getToken = (): string | null => {
-  if (typeof window === 'undefined') return null;
-  return localStorage.getItem(TOKEN_KEY);
-};
-
-export const removeToken = (): void => {
-  localStorage.removeItem(TOKEN_KEY);
-};
-
-interface JwtPayload {
+export interface JwtPayload {
   sub?: string;
   email?: string;
   role?: string;
-  user_metadata?: { role?: string; full_name?: string; email?: string };
+  full_name?: string;
+  name?: string;
   exp?: number;
+  user_metadata?: { role?: string; full_name?: string; email?: string };
+  public_metadata?: { role?: string };
 }
 
 export const decodeToken = (token: string): JwtPayload | null => {
@@ -29,27 +24,37 @@ export const decodeToken = (token: string): JwtPayload | null => {
     return null;
   }
 };
-    
-export const getUserRole = (): string | null => {
-  const token = getToken();
+
+export const getUserRoleFromToken = (token: string | null): string | null => {
   if (!token) return null;
   const payload = decodeToken(token);
   if (!payload) return null;
   const topLevel = payload.role;
   if (topLevel && topLevel !== 'authenticated') return topLevel;
-  return payload.user_metadata?.role ?? null;
+  return payload.user_metadata?.role
+    ?? payload.public_metadata?.role
+    ?? null;
 };
 
-export const getUserId = (): string | null => {
-  const token = getToken();
+export const getUserIdFromToken = (token: string | null): string | null => {
   if (!token) return null;
   return decodeToken(token)?.sub ?? null;
 };
 
-export const isLoggedIn = (): boolean => {
-  const token = getToken();
-  if (!token) return false;
-  const payload = decodeToken(token);
-  if (!payload?.exp) return true;
-  return Date.now() / 1000 < payload.exp;
-};
+/** @deprecated Tokens come from Clerk via AuthTokenBridge — no-op. */
+export const saveToken = (_token: string): void => {};
+
+/** @deprecated Use Clerk getToken({ template: 'quarkus' }) via the API token provider. */
+export const getToken = (): string | null => null;
+
+/** @deprecated Use Clerk signOut() instead. */
+export const removeToken = (): void => {};
+
+/** @deprecated Use useAuth().isSignedIn from @clerk/nextjs. */
+export const isLoggedIn = (): boolean => false;
+
+/** @deprecated Use getUserRoleFromToken(await getToken({ template: 'quarkus' })). */
+export const getUserRole = (): string | null => null;
+
+/** @deprecated Use getUserIdFromToken(await getToken({ template: 'quarkus' })). */
+export const getUserId = (): string | null => null;

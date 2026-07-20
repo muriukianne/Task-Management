@@ -1,320 +1,398 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { isLoggedIn, getUserRole, removeToken } from '../lib/auth';
-import { getTasks, getTask, updateTaskStatus } from '../lib/api';
+import { useAuth, useUser } from '@clerk/nextjs';
+import { decodeToken, getUserRoleFromToken } from '../lib/auth';
+import { getTasks, getTask, updateTaskStatus, syncUser } from '../lib/api';
+import type { Task, AppUser, TaskStatus } from '../lib/api';
+import { useToast } from '../components/providers/ToastContext';
+import DashboardLayout from '../components/layout/DashboardLayout';
+import TaskFilters from '../components/tasks/TaskFilters';
+import TaskTable from '../components/tasks/TaskTable';
+import TaskKanban from '../components/tasks/TaskKanban';
+import TaskDetail from '../components/tasks/TaskDetail';
+import type { SortField, SortDir } from '../components/tasks/TaskFilters';
 
-interface Task {
-  taskId: number;
-  taskTitle: string;
-  taskDescription: string;
-  status: string;
-  assignedTo: string;
-  assignedBy: string;
-  attachedFile: string | null;
-  createdAt: string;
-  updatedAt: string;
+function StatCard({
+  label,
+  value,
+  accent,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: number;
+  accent?: boolean;
+  active?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={[
+        'rounded-xl border p-4 text-center w-full transition-colors',
+        active || accent
+          ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
+          : 'border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50',
+      ].join(' ')}
+    >
+      <p className={`text-2xl font-bold ${active || accent ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
+        {value}
+      </p>
+      <p className="text-xs text-[var(--text-secondary)] font-medium mt-0.5">{label}</p>
+    </button>
+  );
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  created:     'bg-gray-100 text-gray-700',
-  assigned:    'bg-blue-100 text-blue-800',
-  in_progress: 'bg-yellow-100 text-yellow-800',
-  resolved:    'bg-green-100 text-green-800',
-  done:        'bg-emerald-100 text-emerald-800',
-};
+function sortTasks(tasks: Task[], field: SortField, dir: SortDir): Task[] {
+  const priorityOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+  const statusOrder: Record<string, number> = {
+    created: 1, assigned: 2, in_progress: 3, resolved: 4, done: 5,
+  };
 
-const STATUS_LABEL: Record<string, string> = {
-  created:     'Created',
-  assigned:    'Assigned',
-  in_progress: 'In Progress',
-  resolved:    'Resolved',
-  done:        'Done',
-};
+  return [...tasks].sort((a, b) => {
+    let cmp = 0;
 
-function StatusBadge({ status }: { status: string }) {
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${STATUS_COLORS[status] ?? 'bg-gray-100 text-gray-700'}`}>
-      {STATUS_LABEL[status] ?? status}
-    </span>
-  );
+    if (field === 'taskTitle') {
+      cmp = (a.taskTitle ?? '').localeCompare(b.taskTitle ?? '', undefined, { sensitivity: 'base' });
+    } else if (field === 'priority') {
+      cmp = (priorityOrder[a.priority ?? 'medium'] ?? 0) - (priorityOrder[b.priority ?? 'medium'] ?? 0);
+    } else if (field === 'status') {
+      cmp = (statusOrder[a.status] ?? 0) - (statusOrder[b.status] ?? 0);
+    } else if (field === 'dueDate' || field === 'createdAt' || field === 'updatedAt') {
+      const ta = a[field] ? Date.parse(a[field] as string) : NaN;
+      const tb = b[field] ? Date.parse(b[field] as string) : NaN;
+      // Null/missing dates always sink to the bottom
+      if (!a[field] && !b[field]) return 0;
+      if (!a[field]) return 1;
+      if (!b[field]) return -1;
+      cmp = ta - tb;
+    }
+
+    if (cmp === 0) cmp = a.taskId - b.taskId;
+    return dir === 'asc' ? cmp : -cmp;
+  });
+}
+
+function clerkProfile(user: ReturnType<typeof useUser>['user']) {
+  if (!user) return {};
+  return {
+    email:     user.primaryEmailAddress?.emailAddress,
+    firstName: user.firstName ?? undefined,
+    lastName:  user.lastName ?? undefined,
+  };
+}
+
+function displayNameFromClerk(user: ReturnType<typeof useUser>['user']): string | null {
+  if (!user) return null;
+  const full = [user.firstName, user.lastName].filter(Boolean).join(' ').trim();
+  if (full) return full;
+  if (user.fullName?.trim()) return user.fullName.trim();
+  if (user.username?.trim()) return user.username.trim();
+  const email = user.primaryEmailAddress?.emailAddress;
+  if (email) return email.split('@')[0];
+  return null;
 }
 
 export default function EmployeePage() {
   const router = useRouter();
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [msg, setMsg] = useState('');
-  const [msgType, setMsgType] = useState<'ok' | 'err'>('ok');
+  const { toast } = useToast();
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { user: clerkUser, isLoaded: clerkUserLoaded } = useUser();
 
-  // Task detail drawer (uses getTask endpoint)
-  const [detailTask, setDetailTask] = useState<Task | null>(null);
-  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [tasks, setTasks]         = useState<Task[]>([]);
+  const [loading, setLoading]     = useState(true);
+  const [userName, setUserName]   = useState('');
+  const [userEmail, setUserEmail] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName]   = useState('');
+  const [appUserId, setAppUserId] = useState<number | null>(null);
+  const [ready, setReady]         = useState(false);
+
+  const [statusFilter, setStatusFilter]     = useState('all');
+  const [priorityFilter, setPriorityFilter] = useState('all');
+  const [sortField, setSortField]           = useState<SortField>('updatedAt');
+  const [sortDir, setSortDir]               = useState<SortDir>('desc');
+  const [viewMode, setViewMode]             = useState<'table' | 'kanban'>('table');
+
+  const [detailOpen, setDetailOpen]       = useState(false);
+  const [detailTask, setDetailTask]       = useState<Task | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [busyTaskId, setBusyTaskId]       = useState<number | null>(null);
 
   useEffect(() => {
-    if (!isLoggedIn()) { router.replace('/login'); return; }
-    const role = getUserRole();
-    if (role === 'supervisor' || role === 'admin') { router.replace('/supervisor'); return; }
-    fetchTasks();
-  }, []);
+    if (!isLoaded || !clerkUserLoaded) return;
+    if (!isSignedIn) {
+      const t = window.setTimeout(() => {
+        router.replace('/login');
+      }, 800);
+      return () => window.clearTimeout(t);
+    }
 
-  async function fetchTasks() {
+    async function init() {
+      const token = await getToken({ template: 'quarkus' });
+      let role: string | null = getUserRoleFromToken(token);
+      const profile = clerkProfile(clerkUser);
+      const clerkName = displayNameFromClerk(clerkUser);
+      const clerkEmail = clerkUser?.primaryEmailAddress?.emailAddress ?? '';
+
+      try {
+        const me = await syncUser(profile);
+        role = me.role;
+        const fromDb = [me.firstName, me.lastName].filter(Boolean).join(' ').trim();
+        const synthetic = !me.email || me.email.endsWith('@local') || me.firstName === 'User';
+        setUserName(
+          (!synthetic && fromDb) || clerkName || fromDb || me.email.split('@')[0] || 'Me',
+        );
+        setUserEmail(
+          me.email && !me.email.endsWith('@local') ? me.email : (clerkEmail || me.email),
+        );
+        setFirstName(me.firstName || clerkUser?.firstName || '');
+        setLastName(me.lastName || clerkUser?.lastName || '');
+        setAppUserId(me.id);
+      } catch {
+        const payload = token ? decodeToken(token) : null;
+        setUserName(
+          clerkName
+            ?? payload?.full_name
+            ?? payload?.name
+            ?? payload?.user_metadata?.full_name
+            ?? payload?.email?.split('@')[0]
+            ?? 'Me',
+        );
+        setUserEmail(
+          clerkEmail || payload?.email || payload?.user_metadata?.email || '',
+        );
+        setFirstName(clerkUser?.firstName ?? '');
+        setLastName(clerkUser?.lastName ?? '');
+        setAppUserId(null);
+      }
+
+      if (role === 'supervisor' || role === 'admin') {
+        router.replace('/supervisor');
+        return;
+      }
+
+      setReady(true);
+    }
+
+    void init();
+  }, [isLoaded, isSignedIn, clerkUserLoaded, clerkUser, getToken, router]);
+
+  useEffect(() => {
+    if (!ready) return;
+    void fetchTasks();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  const fetchTasks = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await getTasks();
-      if (res.code === 200) setTasks(res.data ?? []);
-    } catch {
-      showMsg('Could not load tasks. Make sure the backend is running.', 'err');
+      const result = await getTasks({ size: 100 });
+      setTasks(result.content);
+    } catch (err: unknown) {
+      toast.error('Load failed', err instanceof Error ? err.message : 'Could not load tasks.');
     } finally {
       setLoading(false);
     }
-  }
-
-  function showMsg(text: string, type: 'ok' | 'err') {
-    setMsg(text);
-    setMsgType(type);
-    setTimeout(() => setMsg(''), 5000);
-  }
+  }, [toast]);
 
   async function handleOpenDetail(task: Task) {
-    setLoadingDetail(true);
     setDetailTask(task);
+    setDetailOpen(true);
+    setDetailLoading(true);
     try {
-      const res = await getTask(task.taskId);
-      if (res.code === 200) setDetailTask(res.data);
-    } catch {
-      // keep the existing task data
+      const fresh = await getTask(task.taskId);
+      setDetailTask(fresh);
+    } catch (err: unknown) {
+      toast.error(
+        'Could not open task',
+        err instanceof Error ? err.message : 'Task details unavailable.',
+      );
     } finally {
-      setLoadingDetail(false);
+      setDetailLoading(false);
     }
   }
 
-  async function handleStatusUpdate(task: Task, newStatus: string) {
-    const res = await updateTaskStatus(task.taskId, newStatus);
-    if (res.code === 200) {
-      showMsg(`Task "${task.taskTitle}" updated to ${STATUS_LABEL[newStatus]}.`, 'ok');
-      fetchTasks();
-      // Refresh detail if open
-      if (detailTask?.taskId === task.taskId) {
-        setDetailTask(res.data);
-      }
-    } else {
-      showMsg(res.msg ?? 'Could not update task status.', 'err');
+  async function handleStatusUp(task: Task, newStatus: string) {
+    if (busyTaskId != null) return;
+
+    const previous = task;
+    const optimistic = { ...task, status: newStatus as TaskStatus };
+
+    setBusyTaskId(task.taskId);
+    setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
+    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
+
+    try {
+      const updated = await updateTaskStatus(task.taskId, newStatus);
+      const label = newStatus === 'in_progress' ? 'in progress' : newStatus.replace('_', ' ');
+      toast.success('Status updated', `"${task.taskTitle}" is now ${label}.`);
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
+    } catch (err: unknown) {
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
+      toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
+    } finally {
+      setBusyTaskId(null);
     }
   }
 
   const counts = {
-    total:       tasks.length,
-    assigned:    tasks.filter((t) => t.status === 'assigned').length,
-    in_progress: tasks.filter((t) => t.status === 'in_progress').length,
-    resolved:    tasks.filter((t) => t.status === 'resolved').length,
-    done:        tasks.filter((t) => t.status === 'done').length,
+    total:      tasks.length,
+    assigned:   tasks.filter((t) => t.status === 'assigned').length,
+    inProgress: tasks.filter((t) => t.status === 'in_progress').length,
+    // Employees finish work as "resolved"; supervisor then marks "done".
+    // Both count as completed from the employee view.
+    completed:  tasks.filter((t) => t.status === 'resolved' || t.status === 'done').length,
   };
 
-  if (loading) {
+  const filtered = tasks.filter((t) => {
+    if (statusFilter === 'completed') {
+      if (t.status !== 'resolved' && t.status !== 'done') return false;
+    } else if (statusFilter !== 'all' && t.status !== statusFilter) {
+      return false;
+    }
+    if (priorityFilter !== 'all' && t.priority !== priorityFilter) return false;
+    return true;
+  });
+  const sorted = sortTasks(filtered, sortField, sortDir);
+
+  const selfUser: AppUser[] = appUserId != null
+    ? [{
+        id:        appUserId,
+        clerkId:   null,
+        email:     userEmail,
+        firstName: firstName || userName.split(' ')[0] || userName,
+        lastName:  lastName || userName.split(' ').slice(1).join(' ') || '',
+        role:      'employee',
+      }]
+    : [];
+
+  if (!ready) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <p className="text-gray-700">Loading your tasks…</p>
+      <div className="min-h-screen bg-[var(--bg)] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin" />
+          <p className="text-sm text-[var(--text-secondary)]">Loading your tasks…</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <DashboardLayout
+      role="employee"
+      userName={userName || 'Me'}
+      userEmail={userEmail}
+      pageTitle="My Tasks"
+    >
+      <div className="space-y-6">
 
-      {/* ── Header ── */}
-      <header className="bg-white border-b px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-indigo-700">Task Manager</h1>
-          <p className="text-xs text-gray-700 font-semibold">My Tasks</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <StatCard
+            label="Total"
+            value={counts.total}
+            active={statusFilter === 'all'}
+            onClick={() => setStatusFilter('all')}
+          />
+          <StatCard
+            label="Assigned"
+            value={counts.assigned}
+            accent={counts.assigned > 0 && statusFilter !== 'assigned'}
+            active={statusFilter === 'assigned'}
+            onClick={() => setStatusFilter('assigned')}
+          />
+          <StatCard
+            label="In Progress"
+            value={counts.inProgress}
+            active={statusFilter === 'in_progress'}
+            onClick={() => setStatusFilter('in_progress')}
+          />
+          <StatCard
+            label="Completed"
+            value={counts.completed}
+            accent={counts.completed > 0 && statusFilter !== 'completed'}
+            active={statusFilter === 'completed'}
+            onClick={() => setStatusFilter('completed')}
+          />
         </div>
-        <button
-          onClick={() => { removeToken(); router.replace('/login'); }}
-          className="text-sm text-gray-700 hover:text-red-600 font-semibold transition-colors"
-        >
-          Sign Out
-        </button>
-      </header>
 
-      <div className="max-w-3xl mx-auto px-4 py-6 space-y-4">
-
-        {msg && (
-          <div className={`rounded-lg px-4 py-3 text-sm font-semibold ${msgType === 'ok' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-            {msg}
-          </div>
+        {counts.assigned > 0 && statusFilter !== 'assigned' && (
+          <button
+            type="button"
+            onClick={() => setStatusFilter('assigned')}
+            className="flex items-center gap-3 rounded-xl bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 px-4 py-3 w-full text-left hover:border-blue-400 transition-colors"
+          >
+            <svg className="w-4 h-4 text-blue-500 flex-shrink-0" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+              <path d="M8 5v3.5M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="text-sm text-blue-800 dark:text-blue-300 font-medium">
+              You have <strong>{counts.assigned}</strong> task{counts.assigned > 1 ? 's' : ''} ready to start.
+            </p>
+          </button>
         )}
 
-        {/* Stats */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {[
-            { label: 'Total',       value: counts.total },
-            { label: 'Assigned',    value: counts.assigned },
-            { label: 'In Progress', value: counts.in_progress },
-            { label: 'Done',        value: counts.done },
-          ].map(({ label, value }) => (
-            <div key={label} className="bg-white rounded-xl border border-gray-200 p-3 text-center">
-              <p className="text-2xl font-bold text-gray-900">{value}</p>
-              <p className="text-xs text-gray-700 font-semibold">{label}</p>
-            </div>
-          ))}
-        </div>
+        <TaskFilters
+          status={statusFilter}
+          priority={priorityFilter}
+          sortField={sortField}
+          sortDir={sortDir}
+          viewMode={viewMode}
+          role="employee"
+          onStatus={setStatusFilter}
+          onPriority={setPriorityFilter}
+          onSort={(f, d) => { setSortField(f); setSortDir(d); }}
+          onViewMode={setViewMode}
+        />
 
-        {counts.assigned > 0 && (
-          <div className="bg-blue-50 border border-blue-200 text-blue-900 rounded-lg px-4 py-3 text-sm font-semibold">
-            You have <span className="font-bold">{counts.assigned}</span> task{counts.assigned > 1 ? 's' : ''} waiting for you to start.
-          </div>
+        {viewMode === 'table' ? (
+          <TaskTable
+            tasks={sorted}
+            users={selfUser}
+            loading={loading}
+            sortField={sortField}
+            sortDir={sortDir}
+            role="employee"
+            busyTaskId={busyTaskId}
+            onSort={(f, d) => { setSortField(f); setSortDir(d); }}
+            onRowClick={handleOpenDetail}
+            onConfirmDone={() => {}}
+            onReAssign={() => {}}
+            onStatusUp={handleStatusUp}
+            emptyDescription="No tasks match these filters. Try All, or wait for your supervisor to assign work."
+          />
+        ) : (
+          <TaskKanban
+            tasks={sorted}
+            users={selfUser}
+            loading={loading}
+            role="employee"
+            busyTaskId={busyTaskId}
+            onOpen={handleOpenDetail}
+            onConfirmDone={() => {}}
+            onStatusUp={handleStatusUp}
+            emptyDescription="No tasks match these filters. Try All, or wait for your supervisor to assign work."
+          />
         )}
 
-        {/* Task list */}
-        <div className="space-y-3">
-          <h2 className="text-sm font-bold text-gray-800 uppercase tracking-wide">My Assigned Tasks</h2>
-
-          {tasks.length === 0 ? (
-            <div className="bg-white rounded-xl border border-gray-200 p-8 text-center text-gray-700">
-              No tasks assigned to you yet. Check back later.
-            </div>
-          ) : (
-            tasks.map((task) => (
-              <div key={task.taskId} className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-                <div className="px-4 py-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <button
-                          onClick={() => handleOpenDetail(task)}
-                          className="font-bold text-gray-900 hover:text-indigo-700 text-left transition-colors"
-                        >
-                          {task.taskTitle}
-                        </button>
-                        <StatusBadge status={task.status} />
-                      </div>
-                      <p className="text-xs text-gray-600 mt-0.5 font-medium">
-                        Updated {new Date(task.updatedAt).toLocaleDateString()}
-                      </p>
-                      <p className="text-sm text-gray-800 mt-2 line-clamp-2">{task.taskDescription}</p>
-                    </div>
-                  </div>
-
-                  {/* Action buttons */}
-                  <div className="flex gap-2 flex-wrap mt-3">
-                    {task.status === 'assigned' && (
-                      <button
-                        onClick={() => handleStatusUpdate(task, 'in_progress')}
-                        className="bg-yellow-500 hover:bg-yellow-600 text-white text-sm px-4 py-2 rounded-lg font-semibold transition-colors"
-                      >
-                        Start Working
-                      </button>
-                    )}
-                    {task.status === 'in_progress' && (
-                      <button
-                        onClick={() => handleStatusUpdate(task, 'resolved')}
-                        className="bg-green-600 hover:bg-green-700 text-white text-sm px-4 py-2 rounded-lg font-semibold transition-colors"
-                      >
-                        Mark as Resolved
-                      </button>
-                    )}
-                    {task.status === 'resolved' && (
-                      <div className="bg-green-50 border border-green-200 text-green-800 rounded-lg px-4 py-2 text-sm font-semibold">
-                        Waiting for supervisor to confirm completion.
-                      </div>
-                    )}
-                    {task.status === 'done' && (
-                      <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg px-4 py-2 text-sm font-bold">
-                        Task completed and confirmed.
-                      </div>
-                    )}
-                    {task.status === 'created' && (
-                      <div className="text-xs text-gray-700 italic font-medium">
-                        Pending formal assignment from supervisor.
-                      </div>
-                    )}
-                    {task.attachedFile && (
-                      <div className="flex items-center gap-2 text-sm bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
-                        <span>📎</span>
-                        <span className="text-purple-800 font-semibold">
-                          {task.attachedFile.split('_').slice(2).join('_') || task.attachedFile}
-                        </span>
-                        <span className="text-xs text-purple-700">(from supervisor)</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
+        <TaskDetail
+          task={detailTask}
+          users={selfUser}
+          loading={detailLoading}
+          role="employee"
+          open={detailOpen}
+          busy={busyTaskId != null && detailTask?.taskId === busyTaskId}
+          onClose={() => setDetailOpen(false)}
+          onConfirmDone={() => {}}
+          onReAssign={() => {}}
+          onStatusUp={handleStatusUp}
+        />
       </div>
-
-      {/* ══ Task detail drawer ══ */}
-      {detailTask && (
-        <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[80vh] overflow-y-auto">
-            <div className="flex items-start justify-between gap-3">
-              <h2 className="text-lg font-bold text-gray-900">{detailTask.taskTitle}</h2>
-              <button
-                onClick={() => setDetailTask(null)}
-                className="text-gray-600 hover:text-gray-900 text-xl font-bold shrink-0"
-              >
-                ✕
-              </button>
-            </div>
-            {loadingDetail ? (
-              <p className="text-sm text-gray-700">Loading…</p>
-            ) : (
-              <>
-                <StatusBadge status={detailTask.status} />
-                <p className="text-sm text-gray-800 whitespace-pre-wrap">{detailTask.taskDescription}</p>
-
-                {detailTask.attachedFile && (
-                  <div className="flex items-center gap-2 text-sm bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
-                    <span>📎</span>
-                    <span className="text-purple-800 font-semibold">
-                      {detailTask.attachedFile.split('_').slice(2).join('_') || detailTask.attachedFile}
-                    </span>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div>
-                    <p className="text-xs text-gray-600 font-bold uppercase tracking-wide">Task ID</p>
-                    <p className="text-gray-900 font-semibold">#{detailTask.taskId}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-600 font-bold uppercase tracking-wide">Created</p>
-                    <p className="text-gray-900">{new Date(detailTask.createdAt).toLocaleDateString()}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-600 font-bold uppercase tracking-wide">Last Updated</p>
-                    <p className="text-gray-900">{new Date(detailTask.updatedAt).toLocaleDateString()}</p>
-                  </div>
-                </div>
-
-                {/* Action buttons inside detail */}
-                <div className="flex gap-2 flex-wrap pt-2">
-                  {detailTask.status === 'assigned' && (
-                    <button
-                      onClick={() => handleStatusUpdate(detailTask, 'in_progress')}
-                      className="bg-yellow-500 hover:bg-yellow-600 text-white text-sm px-4 py-2 rounded-lg font-semibold transition-colors"
-                    >
-                      Start Working
-                    </button>
-                  )}
-                  {detailTask.status === 'in_progress' && (
-                    <button
-                      onClick={() => handleStatusUpdate(detailTask, 'resolved')}
-                      className="bg-green-600 hover:bg-green-700 text-white text-sm px-4 py-2 rounded-lg font-semibold transition-colors"
-                    >
-                      Mark as Resolved
-                    </button>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
-    </div>
+    </DashboardLayout>
   );
 }

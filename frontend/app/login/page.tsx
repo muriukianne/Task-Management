@@ -1,89 +1,72 @@
 'use client';
 
-import { useState, FormEvent } from 'react';
+import { SignIn, useAuth } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
-import { login } from '../lib/api';
-import { saveToken, getUserRole } from '../lib/auth';
+import { useEffect } from 'react';
 
 export default function LoginPage() {
+  const { isLoaded, isSignedIn } = useAuth();
   const router = useRouter();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-    try {
-      const res = await login(email, password);
-      if (res.code !== 200) {
-        setError(res.msg ?? 'Login failed. Check your details and try again.');
-        return;
-      }
-      const token = res.data?.access_token;
-      if (!token) {
-        setError('No token received. Please contact support.');
-        return;
-      }
-      saveToken(token);
-      const role = getUserRole();
-      if (role === 'supervisor' || role === 'admin') {
-        router.replace('/supervisor');
-      } else {
-        router.replace('/employee');
-      }
-    } catch {
-      setError('Could not reach the server. Make sure the backend is running.');
-    } finally {
-      setLoading(false);
+  // If Clerk already has a valid session, leave /login once — never render
+  // <SignIn forceRedirectUrl> while signed-in (that recreates redirect loops).
+  useEffect(() => {
+    if (isLoaded && isSignedIn) {
+      router.replace('/');
     }
+  }, [isLoaded, isSignedIn, router]);
+
+  if (!isLoaded || isSignedIn) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--bg)]">
+        <p className="text-sm text-[var(--text-muted)]">
+          {isSignedIn ? 'Continuing…' : 'Loading…'}
+        </p>
+      </div>
+    );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <div className="bg-white rounded-2xl shadow-md w-full max-w-sm p-8">
-        <h1 className="text-2xl font-bold text-gray-800 mb-1">Task Manager</h1>
-        <p className="text-gray-500 text-sm mb-6">Sign in to your account</p>
+    <div className="min-h-screen flex bg-[var(--bg)]">
+      {/* Left panel (decorative, lg+) */}
+      <div className="hidden lg:flex flex-col justify-between w-[420px] shrink-0 bg-[var(--accent)] px-10 py-12">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center">
+            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+              <path d="M2.5 9l4.5 4.5L15.5 4.5" stroke="white" strokeWidth="2.2"
+                strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+          <span className="text-white text-xl font-bold tracking-tight">TaskFlow</span>
+        </div>
 
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 mb-4 text-sm">
-            {error}
+        <div className="space-y-6">
+          <div>
+            <h2 className="text-3xl font-bold text-white leading-snug">
+              Manage tasks,<br />ship faster.
+            </h2>
+            <p className="mt-3 text-white/70 text-sm leading-relaxed">
+              A focused workspace for your whole team — from employees to supervisors.
+            </p>
           </div>
-        )}
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@example.com"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
-            <input
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="••••••••"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-semibold py-2 rounded-lg text-sm transition-colors"
-          >
-            {loading ? 'Signing in…' : 'Sign In'}
-          </button>
-        </form>
+        <p className="text-white/35 text-xs">© 2026 TaskFlow. All rights reserved.</p>
+      </div>
+
+      {/* Clerk SignIn — only when signed out */}
+      <div className="flex-1 flex items-center justify-center p-8">
+        <SignIn
+          routing="hash"
+          forceRedirectUrl="/"
+          signUpUrl="/login"
+          appearance={{
+            elements: {
+              rootBox: 'w-full max-w-sm',
+              card: 'shadow-none border border-[var(--border)] bg-[var(--surface)]',
+            },
+          }}
+        />
       </div>
     </div>
   );

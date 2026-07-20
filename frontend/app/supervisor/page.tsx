@@ -1,657 +1,670 @@
 'use client';
 
-import { useEffect, useState, useRef, FormEvent, ChangeEvent } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { isLoggedIn, getUserRole, removeToken } from '../lib/auth';
+import { useAuth, useUser } from '@clerk/nextjs';
+import { decodeToken, getUserRoleFromToken } from '../lib/auth';
 import {
   getTasks, getTask, getUsers, createTask, assignTask,
-  updateTaskStatus, uploadTaskFile, createUser,
+  updateTaskStatus, createUser, updateUser, deleteUser, syncUser, ApiError,
 } from '../lib/api';
+import type { Task, AppUser, UserRole, TaskStatus } from '../lib/api';
+import { useToast } from '../components/providers/ToastContext';
+import DashboardLayout from '../components/layout/DashboardLayout';
+import TaskFilters from '../components/tasks/TaskFilters';
+import TaskTable from '../components/tasks/TaskTable';
+import TaskKanban from '../components/tasks/TaskKanban';
+import TaskDetail from '../components/tasks/TaskDetail';
+import CreateTaskModal from '../components/tasks/CreateTaskModal';
+import CreateUserModal from '../components/users/CreateUserModal';
+import EditUserModal from '../components/users/EditUserModal';
+import UserTable from '../components/users/UserTable';
+import Modal from '../components/ui/Modal';
+import UserSelect from '../components/ui/UserSelect';
+import type { SortField, SortDir } from '../components/tasks/TaskFilters';
 
-interface Task {
-  taskId: number;
-  taskTitle: string;
-  taskDescription: string;
-  status: string;
-  assignedTo: string;
-  assignedBy: string;
-  attachedFile: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
+type Tab = 'tasks' | 'users';
 
-interface AppUser {
-  userId: string;
-  email: string;
-  firstName: string;
-  lastName: string;
-  role: string;
-}
-
-type Tab = 'tasks' | 'create-task' | 'create-user' | 'users';
-type StatusFilter = 'all' | 'created' | 'assigned' | 'in_progress' | 'resolved' | 'done';
-
-const STATUS_COLORS: Record<string, string> = {
-  created:     'bg-gray-100 text-gray-700',
-  assigned:    'bg-blue-100 text-blue-800',
-  in_progress: 'bg-yellow-100 text-yellow-800',
-  resolved:    'bg-green-100 text-green-800',
-  done:        'bg-emerald-100 text-emerald-800',
-};
-
-const STATUS_LABEL: Record<string, string> = {
-  created:     'Created',
-  assigned:    'Assigned',
-  in_progress: 'In Progress',
-  resolved:    'Resolved',
-  done:        'Done',
-};
-
-const ROLE_COLORS: Record<string, string> = {
-  admin:      'bg-red-100 text-red-800',
-  supervisor: 'bg-purple-100 text-purple-800',
-  employee:   'bg-blue-100 text-blue-800',
-};
-
-function StatusBadge({ status }: { status: string }) {
+function StatCard({
+  label, value, active, onClick,
+}: {
+  label: string; value: number; active?: boolean; onClick?: () => void;
+}) {
   return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${STATUS_COLORS[status] ?? 'bg-gray-100 text-gray-700'}`}>
-      {STATUS_LABEL[status] ?? status}
-    </span>
+    <div
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? (e) => e.key === 'Enter' && onClick() : undefined}
+      onClick={onClick}
+      className={[
+        'rounded-xl border p-4 text-center transition-all',
+        onClick ? 'cursor-pointer' : '',
+        active
+          ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
+          : 'border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50',
+      ].join(' ')}
+    >
+      <p className={`text-2xl font-bold ${active ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
+        {value}
+      </p>
+      <p className="text-xs text-[var(--text-secondary)] font-medium mt-0.5">{label}</p>
+    </div>
   );
 }
 
-function RoleBadge({ role }: { role: string }) {
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold capitalize ${ROLE_COLORS[role] ?? 'bg-gray-100 text-gray-700'}`}>
-      {role}
-    </span>
-  );
+function sortTasks(tasks: Task[], field: SortField, dir: SortDir): Task[] {
+  return [...tasks].sort((a, b) => {
+    let va: string | number = (a[field as keyof Task] as string) ?? '';
+    let vb: string | number = (b[field as keyof Task] as string) ?? '';
+    if (field === 'priority') {
+      const order: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+      va = order[a.priority ?? 'medium'] ?? 0;
+      vb = order[b.priority ?? 'medium'] ?? 0;
+    }
+    if (va < vb) return dir === 'asc' ? -1 : 1;
+    if (va > vb) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
 }
 
 export default function SupervisorPage() {
   const router = useRouter();
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [users, setUsers] = useState<AppUser[]>([]);
-  const [callerRole, setCallerRole] = useState<string>('supervisor');
+  const { toast } = useToast();
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { user: clerkUser, isLoaded: clerkUserLoaded } = useUser();
+
+  const [callerRole, setCallerRole]   = useState<UserRole>('supervisor');
+  const [userName, setUserName]       = useState('');
+  const [userEmail, setUserEmail]     = useState('');
+  const [ready, setReady]             = useState(false);
+
+  const [tasks, setTasks]             = useState<Task[]>([]);
+  const [users, setUsers]             = useState<AppUser[]>([]);
+  const [loading, setLoading]         = useState(true);
+  const [usersLoading, setUsersLoading] = useState(true);
+
   const [tab, setTab] = useState<Tab>('tasks');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [msg, setMsg] = useState('');
-  const [msgType, setMsgType] = useState<'ok' | 'err'>('ok');
-  const [loading, setLoading] = useState(true);
 
-  // Create task form
-  const [newTitle, setNewTitle] = useState('');
-  const [newDesc, setNewDesc] = useState('');
-  const [newAssignedTo, setNewAssignedTo] = useState('');
-  const [creating, setCreating] = useState(false);
+  const [statusFilter, setStatusFilter]     = useState('all');
+  const [priorityFilter, setPriorityFilter] = useState('all');
+  const [sortField, setSortField]           = useState<SortField>('updatedAt');
+  const [sortDir, setSortDir]               = useState<SortDir>('desc');
+  const [viewMode, setViewMode]             = useState<'table' | 'kanban'>('table');
 
-  // Create user form
-  const [uFirstName, setUFirstName] = useState('');
-  const [uLastName, setULastName]   = useState('');
-  const [uEmail, setUEmail]         = useState('');
-  const [uPassword, setUPassword]   = useState('');
-  const [uRole, setURole]           = useState('employee');
-  const [creatingUser, setCreatingUser] = useState(false);
+  const [createTaskOpen, setCreateTaskOpen] = useState(false);
+  const [createUserOpen, setCreateUserOpen] = useState(false);
+  const [editUser, setEditUser]             = useState<AppUser | null>(null);
+  const [deleteUserTarget, setDeleteUserTarget] = useState<AppUser | null>(null);
+  const [deletingUser, setDeletingUser]     = useState(false);
 
-  // Re-assign modal
+  const [detailOpen, setDetailOpen]       = useState(false);
+  const [detailTask, setDetailTask]       = useState<Task | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
   const [reAssignTask, setReAssignTask] = useState<Task | null>(null);
-  const [reAssignTo, setReAssignTo]     = useState('');
+  const [reAssignTo, setReAssignTo]     = useState<number | ''>('');
   const [reAssigning, setReAssigning]   = useState(false);
 
-  // Task detail drawer
-  const [detailTask, setDetailTask] = useState<Task | null>(null);
-  const [loadingDetail, setLoadingDetail] = useState(false);
+  useEffect(() => {
+    if (!isLoaded || !clerkUserLoaded) return;
+    if (!isSignedIn) {
+      const t = window.setTimeout(() => {
+        router.replace('/login');
+      }, 800);
+      return () => window.clearTimeout(t);
+    }
 
-  const fileRefs = useRef<Record<number, HTMLInputElement | null>>({});
+    async function init() {
+      const token = await getToken({ template: 'quarkus' });
+      let role: string | null = getUserRoleFromToken(token);
+      const profile = {
+        email:     clerkUser?.primaryEmailAddress?.emailAddress,
+        firstName: clerkUser?.firstName ?? undefined,
+        lastName:  clerkUser?.lastName ?? undefined,
+      };
+      const clerkName = [clerkUser?.firstName, clerkUser?.lastName].filter(Boolean).join(' ').trim()
+        || clerkUser?.fullName
+        || clerkUser?.primaryEmailAddress?.emailAddress?.split('@')[0]
+        || null;
+      const clerkEmail = clerkUser?.primaryEmailAddress?.emailAddress ?? '';
+
+      try {
+        const me = await syncUser(profile);
+        role = me.role;
+        const fromDb = [me.firstName, me.lastName].filter(Boolean).join(' ').trim();
+        const synthetic = !me.email || me.email.endsWith('@local') || me.firstName === 'User';
+        setUserName(
+          (!synthetic && fromDb) || clerkName || fromDb || me.email.split('@')[0] || 'Supervisor',
+        );
+        setUserEmail(
+          me.email && !me.email.endsWith('@local') ? me.email : (clerkEmail || me.email),
+        );
+      } catch {
+        const payload = token ? decodeToken(token) : null;
+        setUserName(
+          clerkName
+            ?? payload?.full_name
+            ?? payload?.name
+            ?? payload?.user_metadata?.full_name
+            ?? payload?.email?.split('@')[0]
+            ?? 'Supervisor',
+        );
+        setUserEmail(clerkEmail || payload?.email || payload?.user_metadata?.email || '');
+      }
+
+      if (role !== 'supervisor' && role !== 'admin') {
+        router.replace('/employee');
+        return;
+      }
+      setCallerRole(role as UserRole);
+      setReady(true);
+    }
+
+    void init();
+  }, [isLoaded, isSignedIn, clerkUserLoaded, clerkUser, getToken, router]);
 
   useEffect(() => {
-    if (!isLoggedIn()) { router.replace('/login'); return; }
-    const role = getUserRole();
-    if (role !== 'supervisor' && role !== 'admin') { router.replace('/employee'); return; }
-    setCallerRole(role ?? 'supervisor');
-    fetchAll();
-  }, []);
+    if (!ready) return;
+    void fetchAll();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
 
-  async function fetchAll() {
+  const fetchAll = useCallback(async () => {
     setLoading(true);
+    setUsersLoading(true);
+    const errors: string[] = [];
+
     try {
-      const [tr, ur] = await Promise.all([getTasks(), getUsers()]);
-      if (tr.code === 200) setTasks(tr.data ?? []);
-      if (ur.code === 200) setUsers(ur.data ?? []);
-    } catch {
-      showMsg('Could not load data from the server.', 'err');
+      const taskResult = await getTasks({ size: 100 });
+      setTasks(taskResult.content);
+    } catch (err: unknown) {
+      errors.push(err instanceof Error ? err.message : 'Could not load tasks.');
     } finally {
       setLoading(false);
     }
-  }
 
-  function showMsg(text: string, type: 'ok' | 'err') {
-    setMsg(text);
-    setMsgType(type);
-    setTimeout(() => setMsg(''), 5000);
-  }
+    try {
+      const userResult = await getUsers();
+      setUsers(userResult);
+    } catch (err: unknown) {
+      errors.push(err instanceof Error ? err.message : 'Could not load team.');
+    } finally {
+      setUsersLoading(false);
+    }
 
-  function getUserName(userId: string) {
-    const u = users.find((x) => x.userId === userId);
-    return u ? `${u.firstName} ${u.lastName}` : userId;
-  }
+    if (errors.length) {
+      toast.error('Load failed', errors.join(' '));
+    }
+  }, [toast]);
 
   async function handleOpenDetail(task: Task) {
-    setLoadingDetail(true);
     setDetailTask(task);
+    setDetailOpen(true);
+    setDetailLoading(true);
     try {
-      const res = await getTask(task.taskId);
-      if (res.code === 200) setDetailTask(res.data);
+      const fresh = await getTask(task.taskId);
+      setDetailTask(fresh);
     } catch {
-      // keep the task data we already have
+      // keep existing data
     } finally {
-      setLoadingDetail(false);
+      setDetailLoading(false);
     }
   }
 
-  async function handleCreateTask(e: FormEvent) {
-    e.preventDefault();
-    if (!newAssignedTo) { showMsg('Please select a user to assign the task to.', 'err'); return; }
-    setCreating(true);
-    try {
-      const res = await createTask({
-        taskTitle: newTitle,
-        taskDescription: newDesc,
-        assignedTo: newAssignedTo,
-      });
-      if (res.code === 200) {
-        showMsg('Task created and assigned successfully.', 'ok');
-        setNewTitle(''); setNewDesc(''); setNewAssignedTo('');
-        setTab('tasks');
-        fetchAll();
-      } else {
-        showMsg(res.msg ?? 'Failed to create task.', 'err');
-      }
-    } catch {
-      showMsg('Server error while creating task.', 'err');
-    } finally {
-      setCreating(false);
-    }
-  }
+  async function handleStatusUp(task: Task, newStatus: string) {
+    const previous = task;
+    const optimistic = { ...task, status: newStatus as TaskStatus };
 
-  async function handleCreateUser(e: FormEvent) {
-    e.preventDefault();
-    setCreatingUser(true);
+    setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
+    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
+
     try {
-      const res = await createUser({
-        firstName: uFirstName, lastName: uLastName,
-        email: uEmail, password: uPassword, role: uRole,
-      });
-      if (res.code === 200) {
-        showMsg(`${uRole} account created for ${uEmail}.`, 'ok');
-        setUFirstName(''); setULastName(''); setUEmail('');
-        setUPassword(''); setURole('employee');
-        fetchAll();
-      } else {
-        showMsg(res.msg ?? 'Failed to create user.', 'err');
-      }
-    } catch {
-      showMsg('Server error while creating user.', 'err');
-    } finally {
-      setCreatingUser(false);
+      const updated = await updateTaskStatus(task.taskId, newStatus);
+      toast.success('Status updated', `"${task.taskTitle}" → ${newStatus.replace('_', ' ')}.`);
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
+    } catch (err: unknown) {
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
+      toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
     }
   }
 
   async function handleConfirmDone(task: Task) {
-    const res = await updateTaskStatus(task.taskId, 'done');
-    if (res.code === 200) {
-      showMsg(`Task "${task.taskTitle}" marked as Done.`, 'ok');
-      fetchAll();
-    } else {
-      showMsg(res.msg ?? 'Failed to update task.', 'err');
+    const previous = task;
+    const optimistic = { ...task, status: 'done' as TaskStatus };
+
+    setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
+    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
+
+    try {
+      const updated = await updateTaskStatus(task.taskId, 'done');
+      toast.success('Task completed', `"${task.taskTitle}" marked as done.`);
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
+    } catch (err: unknown) {
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
+      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
+      toast.error('Failed', err instanceof Error ? err.message : 'Could not confirm task.');
     }
   }
 
-  async function handleReAssign(e: FormEvent) {
+  async function handleCreateTask(data: {
+    taskTitle: string;
+    taskDescription: string;
+    assignedTo: number;
+    priority: string;
+    dueDate?: string;
+  }) {
+    const created = await createTask(data);
+    toast.success('Task created', `"${created.taskTitle}" has been assigned.`);
+    setTasks((prev) => [created, ...prev]);
+  }
+
+  async function handleReAssign(e: React.FormEvent) {
     e.preventDefault();
-    if (!reAssignTask || !reAssignTo) return;
+    if (!reAssignTask || typeof reAssignTo !== 'number') return;
     setReAssigning(true);
     try {
-      const res = await assignTask(reAssignTask.taskId, reAssignTo);
-      if (res.code === 200) {
-        showMsg(`Task re-assigned to ${getUserName(reAssignTo)}.`, 'ok');
-        setReAssignTask(null);
-        fetchAll();
-      } else {
-        showMsg(res.msg ?? 'Failed to re-assign task.', 'err');
-      }
-    } catch {
-      showMsg('Server error while re-assigning task.', 'err');
+      const updated = await assignTask(reAssignTask.taskId, reAssignTo);
+      const member  = users.find((u) => u.id === reAssignTo);
+      toast.success('Task reassigned', `Assigned to ${member ? `${member.firstName} ${member.lastName}` : `#${reAssignTo}`}.`);
+      setTasks((prev) => prev.map((t) => (t.taskId === reAssignTask.taskId ? updated : t)));
+      setReAssignTask(null);
+    } catch (err: unknown) {
+      toast.error('Reassign failed', err instanceof Error ? err.message : 'Could not reassign task.');
     } finally {
       setReAssigning(false);
     }
   }
 
-  async function handleFileChange(taskId: number, e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const res = await uploadTaskFile(taskId, file);
-    if (res.code === 200) {
-      showMsg('File uploaded successfully.', 'ok');
-      fetchAll();
-    } else {
-      showMsg(res.msg ?? 'File upload failed.', 'err');
+  async function handleCreateUser(data: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    role: string;
+  }) {
+    try {
+      await createUser(data);
+      toast.success('Account created', `${data.role} account for ${data.email} is ready.`);
+      const fresh = await getUsers();
+      setUsers(fresh);
+    } catch (err: unknown) {
+      const detail = err instanceof ApiError && err.errors?.length
+        ? err.errors.join('; ')
+        : err instanceof Error ? err.message : 'Something went wrong.';
+      toast.error('Could not create account', detail);
+      throw err;
     }
-    e.target.value = '';
   }
 
-  // Admin sees all users; supervisor sees only employees in Users tab
-  const usersTabList = callerRole === 'admin' ? users : users.filter((u) => u.role === 'employee');
-  const filteredTasks = statusFilter === 'all'
-    ? tasks
-    : tasks.filter((t) => t.status === statusFilter);
-  const resolvedCount = tasks.filter((t) => t.status === 'resolved').length;
-
-  const tabs: { key: Tab; label: string }[] = [
-    { key: 'tasks',       label: 'All Tasks' },
-    { key: 'create-task', label: '+ New Task' },
-    { key: 'create-user', label: '+ New Account' },
-    { key: 'users',       label: 'Users' },
-  ];
-
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <p className="text-gray-700">Loading…</p>
-      </div>
-    );
+  async function handleUpdateUser(
+    id: number,
+    data: { firstName: string; lastName: string; email: string; role: string },
+  ) {
+    try {
+      const updated = await updateUser(id, data);
+      toast.success('Member updated', `${updated.firstName} ${updated.lastName} saved.`);
+      setUsers((prev) => prev.map((u) => (u.id === id ? updated : u)));
+    } catch (err: unknown) {
+      const detail = err instanceof ApiError && err.errors?.length
+        ? err.errors.join('; ')
+        : err instanceof Error ? err.message : 'Something went wrong.';
+      toast.error('Could not update member', detail);
+      throw err;
+    }
   }
+
+  async function handleConfirmDeleteUser() {
+    if (!deleteUserTarget) return;
+    setDeletingUser(true);
+    try {
+      await deleteUser(deleteUserTarget.id);
+      toast.success(
+        'Member removed',
+        `${deleteUserTarget.firstName} ${deleteUserTarget.lastName} was deleted.`,
+      );
+      setUsers((prev) => prev.filter((u) => u.id !== deleteUserTarget.id));
+      setDeleteUserTarget(null);
+    } catch (err: unknown) {
+      toast.error(
+        'Could not delete member',
+        err instanceof Error ? err.message : 'Something went wrong.',
+      );
+    } finally {
+      setDeletingUser(false);
+    }
+  }
+
+  async function handleCreateTaskSafe(data: {
+    taskTitle: string;
+    taskDescription: string;
+    assignedTo: number;
+    priority: string;
+    dueDate?: string;
+  }) {
+    try {
+      await handleCreateTask(data);
+    } catch (err: unknown) {
+      toast.error(
+        'Could not create task',
+        err instanceof Error ? err.message : 'Something went wrong.',
+      );
+      throw err;
+    }
+  }
+
+  const resolvedCount  = tasks.filter((t) => t.status === 'resolved').length;
+  const visibleUsers   = callerRole === 'admin' ? users : users.filter((u) => u.role === 'employee');
+  const assignableUsers = users.filter((u) => u.role === 'employee');
+
+  const filteredTasks = tasks.filter((t) => {
+    if (statusFilter   !== 'all' && t.status   !== statusFilter)   return false;
+    if (priorityFilter !== 'all' && t.priority !== priorityFilter) return false;
+    return true;
+  });
+  const sortedTasks = sortTasks(filteredTasks, sortField, sortDir);
+
+  const STATS = [
+    { s: 'all',         label: 'Total',       value: tasks.length },
+    { s: 'created',     label: 'Created',     value: tasks.filter((t) => t.status === 'created').length },
+    { s: 'assigned',    label: 'Assigned',    value: tasks.filter((t) => t.status === 'assigned').length },
+    { s: 'in_progress', label: 'In Progress', value: tasks.filter((t) => t.status === 'in_progress').length },
+    { s: 'resolved',    label: 'Resolved',    value: resolvedCount },
+    { s: 'done',        label: 'Done',        value: tasks.filter((t) => t.status === 'done').length },
+  ] as const;
+
+  const headerActions = (
+    <div className="flex gap-2">
+      <button
+        onClick={() => setCreateUserOpen(true)}
+        className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-[var(--border)] text-sm font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
+      >
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+          <circle cx="5.5" cy="4" r="2.5" stroke="currentColor" strokeWidth="1.4"/>
+          <path d="M1 12c0-2.2 2-4 4.5-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+          <path d="M10 8v4M8 10h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+        New Account
+      </button>
+      <button
+        onClick={() => setCreateTaskOpen(true)}
+        className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-sm font-medium text-white transition-colors"
+      >
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+          <path d="M7 2v10M2 7h10" stroke="white" strokeWidth="1.8" strokeLinecap="round"/>
+        </svg>
+        New Task
+      </button>
+    </div>
+  );
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <DashboardLayout
+      role={callerRole}
+      userName={userName}
+      userEmail={userEmail}
+      pageTitle={callerRole === 'admin' ? 'Admin Dashboard' : 'Supervisor Dashboard'}
+      actions={headerActions}
+    >
+      <div className="space-y-6">
 
-      {/* ── Header ── */}
-      <header className="bg-white border-b px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-indigo-700">Task Manager</h1>
-          <p className="text-xs text-gray-700 capitalize font-medium">{callerRole} Dashboard</p>
+        {/* Stats row */}
+        <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+          {STATS.map(({ s, label, value }) => (
+            <StatCard
+              key={s}
+              label={label}
+              value={value}
+              active={tab === 'tasks' && statusFilter === s}
+              onClick={() => { setTab('tasks'); setStatusFilter(s); }}
+            />
+          ))}
         </div>
-        <button
-          onClick={() => { removeToken(); router.replace('/login'); }}
-          className="text-sm text-gray-700 hover:text-red-600 font-semibold transition-colors"
-        >
-          Sign Out
-        </button>
-      </header>
 
-      <div className="max-w-5xl mx-auto px-4 py-6 space-y-4">
-
-        {/* ── Alert banner ── */}
-        {msg && (
-          <div className={`rounded-lg px-4 py-3 text-sm font-semibold ${msgType === 'ok' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-            {msg}
-          </div>
-        )}
-
+        {/* Resolved alert */}
         {resolvedCount > 0 && (
-          <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-4 py-3 text-sm flex items-center gap-2 font-semibold">
-            ⚠ {resolvedCount} task{resolvedCount > 1 ? 's are' : ' is'} waiting for your review.
-            <button onClick={() => { setStatusFilter('resolved'); setTab('tasks'); }} className="underline ml-auto font-bold">
-              View now
+          <div className="flex items-center gap-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-4 py-3">
+            <svg className="w-4 h-4 text-amber-500 flex-shrink-0" viewBox="0 0 16 16" fill="none">
+              <path d="M8 2L14 13H2L8 2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+              <path d="M8 6.5v3M8 11.5h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="text-sm text-amber-800 dark:text-amber-300 font-medium flex-1">
+              <strong>{resolvedCount}</strong> task{resolvedCount > 1 ? 's are' : ' is'} waiting for your confirmation.
+            </p>
+            <button
+              onClick={() => { setTab('tasks'); setStatusFilter('resolved'); }}
+              className="text-xs font-semibold text-amber-700 dark:text-amber-400 hover:underline whitespace-nowrap"
+            >
+              Review now
             </button>
           </div>
         )}
 
-        {/* ── Stats cards ── */}
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
-          {(['all', 'created', 'assigned', 'in_progress', 'resolved', 'done'] as const).map((s) => {
-            const count = s === 'all' ? tasks.length : tasks.filter((t) => t.status === s).length;
-            return (
-              <button
-                key={s}
-                onClick={() => { setStatusFilter(s); setTab('tasks'); }}
-                className={`rounded-xl p-3 text-center border transition-all ${statusFilter === s && tab === 'tasks' ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'}`}
-              >
-                <p className="text-2xl font-bold text-gray-900">{count}</p>
-                <p className="text-xs text-gray-700 font-medium capitalize">{s === 'all' ? 'Total' : STATUS_LABEL[s]}</p>
-              </button>
-            );
-          })}
-        </div>
-
-        {/* ── Tab bar ── */}
-        <div className="flex gap-1 border-b border-gray-200">
-          {tabs.map(({ key, label }) => (
+        {/* Tab bar */}
+        <div className="flex gap-1 border-b border-[var(--border)]">
+          {([
+            { key: 'tasks', label: 'Tasks' },
+            { key: 'users', label: `Team (${visibleUsers.length})` },
+          ] as { key: Tab; label: string }[]).map(({ key, label }) => (
             <button
               key={key}
               onClick={() => setTab(key)}
-              className={`px-4 py-2 text-sm font-semibold border-b-2 -mb-px transition-colors ${tab === key ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-gray-600 hover:text-gray-900'}`}
+              className={[
+                'px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors',
+                tab === key
+                  ? 'border-[var(--accent)] text-[var(--accent)]'
+                  : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]',
+              ].join(' ')}
             >
               {label}
             </button>
           ))}
         </div>
 
-        {/* ══ All Tasks tab ══ */}
+        {/* ── Tasks tab ── */}
         {tab === 'tasks' && (
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {(['all', 'created', 'assigned', 'in_progress', 'resolved', 'done'] as const).map((s) => (
-                <button
-                  key={s}
-                  onClick={() => setStatusFilter(s)}
-                  className={`px-3 py-1 rounded-full text-xs font-semibold border transition-all ${statusFilter === s ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-300 hover:border-indigo-400'}`}
-                >
-                  {s === 'all' ? 'All' : STATUS_LABEL[s]}
-                </button>
-              ))}
-            </div>
+          <div className="space-y-4">
+            <TaskFilters
+              status={statusFilter}
+              priority={priorityFilter}
+              sortField={sortField}
+              sortDir={sortDir}
+              viewMode={viewMode}
+              onStatus={setStatusFilter}
+              onPriority={setPriorityFilter}
+              onSort={(f, d) => { setSortField(f); setSortDir(d); }}
+              onViewMode={setViewMode}
+            />
 
-            {filteredTasks.length === 0 ? (
-              <div className="bg-white rounded-xl border border-gray-200 p-8 text-center text-gray-700">
-                No tasks found. Use the &quot;+ New Task&quot; tab to create one.
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {filteredTasks.map((task) => (
-                  <div key={task.taskId} className="bg-white rounded-xl border border-gray-200 p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <button
-                            onClick={() => handleOpenDetail(task)}
-                            className="font-bold text-gray-900 hover:text-indigo-700 text-left transition-colors"
-                          >
-                            {task.taskTitle}
-                          </button>
-                          <StatusBadge status={task.status} />
-                          {task.attachedFile && (
-                            <span className="text-xs bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full font-semibold">
-                              📎 file attached
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-sm text-gray-700 mt-1 line-clamp-2">{task.taskDescription}</p>
-                        <p className="text-xs text-gray-600 mt-1">
-                          Assigned to: <span className="text-gray-900 font-semibold">{getUserName(task.assignedTo)}</span>
-                          &nbsp;·&nbsp;Updated: {new Date(task.updatedAt).toLocaleDateString()}
-                        </p>
-                      </div>
-                      <div className="flex flex-col gap-1 shrink-0">
-                        {task.status === 'resolved' && (
-                          <button
-                            onClick={() => handleConfirmDone(task)}
-                            className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors"
-                          >
-                            Confirm Done
-                          </button>
-                        )}
-                        {(task.status === 'created' || task.status === 'assigned') && (
-                          <button
-                            onClick={() => { setReAssignTask(task); setReAssignTo(task.assignedTo ?? ''); }}
-                            className="bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors border border-blue-200"
-                          >
-                            Re-assign
-                          </button>
-                        )}
-                        <button
-                          onClick={() => fileRefs.current[task.taskId]?.click()}
-                          className="bg-indigo-50 hover:bg-indigo-100 text-indigo-800 text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors border border-indigo-200"
-                        >
-                          Upload File
-                        </button>
-                        <input
-                          type="file"
-                          ref={(el) => { fileRefs.current[task.taskId] = el; }}
-                          className="hidden"
-                          onChange={(e) => handleFileChange(task.taskId, e)}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ══ Create Task tab ══ */}
-        {tab === 'create-task' && (
-          <div className="bg-white rounded-xl border border-gray-200 p-6 max-w-lg">
-            <h2 className="text-lg font-bold text-gray-900 mb-4">Create a New Task</h2>
-            <form onSubmit={handleCreateTask} className="space-y-4">
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Task Title</label>
-                <input
-                  required value={newTitle}
-                  onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="Short title for the task"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Description</label>
-                <textarea
-                  required value={newDesc}
-                  onChange={(e) => setNewDesc(e.target.value)}
-                  rows={3}
-                  placeholder="Describe what needs to be done"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Assign To</label>
-                {users.length > 0 ? (
-                  <select
-                    value={newAssignedTo}
-                    onChange={(e) => setNewAssignedTo(e.target.value)}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            {viewMode === 'table' ? (
+              <TaskTable
+                tasks={sortedTasks}
+                users={users}
+                loading={loading}
+                sortField={sortField}
+                sortDir={sortDir}
+                role={callerRole}
+                onSort={(f, d) => { setSortField(f); setSortDir(d); }}
+                onRowClick={handleOpenDetail}
+                onConfirmDone={handleConfirmDone}
+                onReAssign={(task) => { setReAssignTask(task); setReAssignTo(task.assignedTo); }}
+                onStatusUp={handleStatusUp}
+                emptyAction={
+                  <button
+                    onClick={() => setCreateTaskOpen(true)}
+                    className="px-5 py-2.5 rounded-xl bg-[var(--accent)] text-white text-sm font-semibold hover:bg-[var(--accent-hover)] active:scale-95 transition-transform animate-cta-pulse"
                   >
-                    <option value="">-- Select user --</option>
-                    {users.map((u) => (
-                      <option key={u.userId} value={u.userId}>
-                        {u.firstName} {u.lastName} ({u.role}) — {u.email}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <div className="space-y-1">
-                    <input
-                      value={newAssignedTo}
-                      onChange={(e) => setNewAssignedTo(e.target.value)}
-                      placeholder="User ID"
-                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                    />
-                    <p className="text-xs text-gray-700">No users found. Create accounts first.</p>
-                  </div>
-                )}
-              </div>
-              <button
-                type="submit" disabled={creating}
-                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-bold py-2 px-6 rounded-lg text-sm transition-colors"
-              >
-                {creating ? 'Creating…' : 'Create Task'}
-              </button>
-            </form>
-          </div>
-        )}
-
-        {/* ══ Create User tab ══ */}
-        {tab === 'create-user' && (
-          <div className="bg-white rounded-xl border border-gray-200 p-6 max-w-lg">
-            <h2 className="text-lg font-bold text-gray-900 mb-4">Create a New Account</h2>
-            <form onSubmit={handleCreateUser} className="space-y-4">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-semibold text-gray-800 mb-1">First Name</label>
-                  <input required value={uFirstName} onChange={(e) => setUFirstName(e.target.value)}
-                    placeholder="John"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-semibold text-gray-800 mb-1">Last Name</label>
-                  <input required value={uLastName} onChange={(e) => setULastName(e.target.value)}
-                    placeholder="Doe"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Email</label>
-                <input required type="email" value={uEmail} onChange={(e) => setUEmail(e.target.value)}
-                  placeholder="john.doe@company.com"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Password</label>
-                <input required type="password" value={uPassword} onChange={(e) => setUPassword(e.target.value)}
-                  placeholder="Minimum 6 characters"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Role</label>
-                <select value={uRole} onChange={(e) => setURole(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                >
-                  <option value="employee">Employee</option>
-                  {callerRole === 'admin' && <option value="supervisor">Supervisor</option>}
-                  {callerRole === 'admin' && <option value="admin">Admin</option>}
-                </select>
-              </div>
-              <button
-                type="submit" disabled={creatingUser}
-                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-bold py-2 px-6 rounded-lg text-sm transition-colors"
-              >
-                {creatingUser ? 'Creating…' : 'Create Account'}
-              </button>
-            </form>
-          </div>
-        )}
-
-        {/* ══ Users tab ══ */}
-        {tab === 'users' && (
-          <div className="space-y-3">
-            <p className="text-sm text-gray-800 font-semibold">
-              {callerRole === 'admin'
-                ? `All users (${usersTabList.length})`
-                : `Employees (${usersTabList.length})`}
-            </p>
-            {usersTabList.length === 0 ? (
-              <div className="bg-white rounded-xl border border-gray-200 p-8 text-center text-gray-700">
-                No users found. Create accounts using the &quot;+ New Account&quot; tab.
-              </div>
+                    Create Task
+                  </button>
+                }
+              />
             ) : (
-              <div className="bg-white rounded-xl border border-gray-200 divide-y divide-gray-100">
-                {usersTabList.map((u) => (
-                  <div key={u.userId} className="flex items-center justify-between px-4 py-3">
-                    <div>
-                      <p className="font-bold text-gray-900">{u.firstName} {u.lastName}</p>
-                      <p className="text-sm text-gray-700">{u.email}</p>
-                    </div>
-                    <RoleBadge role={u.role} />
-                  </div>
-                ))}
-              </div>
+              <TaskKanban
+                tasks={sortedTasks}
+                users={users}
+                loading={loading}
+                role={callerRole}
+                onOpen={handleOpenDetail}
+                onConfirmDone={handleConfirmDone}
+                onStatusUp={handleStatusUp}
+                emptyAction={
+                  <button
+                    onClick={() => setCreateTaskOpen(true)}
+                    className="px-5 py-2.5 rounded-xl bg-[var(--accent)] text-white text-sm font-semibold hover:bg-[var(--accent-hover)] active:scale-95 transition-transform animate-cta-pulse"
+                  >
+                    Create Task
+                  </button>
+                }
+              />
             )}
           </div>
         )}
 
+        {/* ── Users tab ── */}
+        {tab === 'users' && (
+          <UserTable
+            users={visibleUsers}
+            loading={usersLoading}
+            onEdit={setEditUser}
+            onDelete={setDeleteUserTarget}
+            emptyAction={
+              <button
+                onClick={() => setCreateUserOpen(true)}
+                className="px-4 py-2 rounded-xl bg-[var(--accent)] text-white text-sm font-semibold hover:bg-[var(--accent-hover)] transition-colors"
+              >
+                Create Account
+              </button>
+            }
+          />
+        )}
       </div>
 
-      {/* ══ Re-assign modal ══ */}
-      {reAssignTask && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
-            <h2 className="text-lg font-bold text-gray-900">Re-assign Task</h2>
-            <p className="text-sm text-gray-700">
-              Task: <span className="font-semibold">{reAssignTask.taskTitle}</span>
-            </p>
-            <form onSubmit={handleReAssign} className="space-y-4">
-              <div>
-                <label className="block text-sm font-semibold text-gray-800 mb-1">Assign To</label>
-                <select
-                  value={reAssignTo}
-                  onChange={(e) => setReAssignTo(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                  required
-                >
-                  <option value="">-- Select user --</option>
-                  {users.map((u) => (
-                    <option key={u.userId} value={u.userId}>
-                      {u.firstName} {u.lastName} ({u.role}) — {u.email}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex gap-2 justify-end">
-                <button
-                  type="button"
-                  onClick={() => setReAssignTask(null)}
-                  className="px-4 py-2 text-sm font-semibold text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit" disabled={reAssigning || !reAssignTo}
-                  className="px-4 py-2 text-sm font-bold bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white rounded-lg transition-colors"
-                >
-                  {reAssigning ? 'Saving…' : 'Confirm'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      {/* ── Modals ── */}
 
-      {/* ══ Task detail drawer ══ */}
-      {detailTask && (
-        <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[80vh] overflow-y-auto">
-            <div className="flex items-start justify-between gap-3">
-              <h2 className="text-lg font-bold text-gray-900">{detailTask.taskTitle}</h2>
-              <button
-                onClick={() => setDetailTask(null)}
-                className="text-gray-500 hover:text-gray-900 text-xl font-bold shrink-0"
-              >
-                ✕
-              </button>
-            </div>
-            {loadingDetail ? (
-              <p className="text-sm text-gray-600">Loading details…</p>
-            ) : (
-              <>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <StatusBadge status={detailTask.status} />
-                  {detailTask.attachedFile && (
-                    <span className="text-xs bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full font-semibold">
-                      📎 {detailTask.attachedFile.split('_').slice(2).join('_') || detailTask.attachedFile}
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm text-gray-800 whitespace-pre-wrap">{detailTask.taskDescription}</p>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div>
-                    <p className="text-xs text-gray-600 font-semibold uppercase tracking-wide">Assigned To</p>
-                    <p className="text-gray-900 font-semibold">{getUserName(detailTask.assignedTo)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-600 font-semibold uppercase tracking-wide">Created</p>
-                    <p className="text-gray-900">{new Date(detailTask.createdAt).toLocaleDateString()}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-600 font-semibold uppercase tracking-wide">Task ID</p>
-                    <p className="text-gray-900">#{detailTask.taskId}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-600 font-semibold uppercase tracking-wide">Last Updated</p>
-                    <p className="text-gray-900">{new Date(detailTask.updatedAt).toLocaleDateString()}</p>
-                  </div>
-                </div>
-              </>
+      <TaskDetail
+        task={detailTask}
+        users={users}
+        loading={detailLoading}
+        role={callerRole}
+        open={detailOpen}
+        onClose={() => setDetailOpen(false)}
+        onConfirmDone={(task) => { handleConfirmDone(task); setDetailOpen(false); }}
+        onReAssign={(task) => {
+          setReAssignTask(task);
+          setReAssignTo(task.assignedTo);
+          setDetailOpen(false);
+        }}
+        onStatusUp={handleStatusUp}
+      />
+
+      <CreateTaskModal
+        open={createTaskOpen}
+        users={assignableUsers}
+        onClose={() => setCreateTaskOpen(false)}
+        onSubmit={handleCreateTaskSafe}
+      />
+
+      <CreateUserModal
+        open={createUserOpen}
+        callerRole={callerRole}
+        onClose={() => setCreateUserOpen(false)}
+        onSubmit={handleCreateUser}
+      />
+
+      <EditUserModal
+        open={!!editUser}
+        user={editUser}
+        callerRole={callerRole}
+        onClose={() => setEditUser(null)}
+        onSubmit={handleUpdateUser}
+      />
+
+      <Modal
+        open={!!deleteUserTarget}
+        onClose={() => !deletingUser && setDeleteUserTarget(null)}
+        title="Delete Team Member"
+        description={
+          deleteUserTarget
+            ? `Remove ${deleteUserTarget.firstName} ${deleteUserTarget.lastName} (${deleteUserTarget.email}) from the team? This cannot be undone.`
+            : undefined
+        }
+        size="sm"
+      >
+        <div className="flex justify-end gap-3 pt-2">
+          <button
+            type="button"
+            disabled={deletingUser}
+            onClick={() => setDeleteUserTarget(null)}
+            className="px-4 py-2.5 rounded-xl border border-[var(--border)] text-sm font-semibold text-[var(--text-secondary)] hover:bg-[var(--surface-2)] transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={deletingUser}
+            onClick={() => void handleConfirmDeleteUser()}
+            className="px-5 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-semibold transition-colors flex items-center gap-2"
+          >
+            {deletingUser && (
+              <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3"
+                  strokeDasharray="32" strokeDashoffset="32" strokeLinecap="round"/>
+              </svg>
             )}
-          </div>
+            {deletingUser ? 'Deleting…' : 'Delete'}
+          </button>
         </div>
-      )}
+      </Modal>
 
-    </div>
+      {/* Reassign modal */}
+      <Modal
+        open={!!reAssignTask}
+        onClose={() => setReAssignTask(null)}
+        title="Reassign Task"
+        description={`Reassign "${reAssignTask?.taskTitle ?? ''}" to another team member.`}
+        size="sm"
+      >
+        <form onSubmit={handleReAssign} className="space-y-5">
+          <div>
+            <label htmlFor="ra-user" className="block text-sm font-medium text-[var(--text-primary)] mb-1.5">
+              Assign To <span className="text-red-500">*</span>
+            </label>
+            <UserSelect
+              id="ra-user"
+              name="reAssignTo"
+              users={assignableUsers}
+              value={reAssignTo}
+              onChange={setReAssignTo}
+              required
+            />
+          </div>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => setReAssignTask(null)}
+              className="px-4 py-2.5 rounded-xl border border-[var(--border)] text-sm font-semibold text-[var(--text-secondary)] hover:bg-[var(--surface-2)] transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={reAssigning || !reAssignTo}
+              className="px-5 py-2.5 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors flex items-center gap-2"
+            >
+              {reAssigning && (
+                <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
+                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3"
+                    strokeDasharray="32" strokeDashoffset="32" strokeLinecap="round"/>
+                </svg>
+              )}
+              {reAssigning ? 'Assigning…' : 'Reassign'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+    </DashboardLayout>
   );
 }
