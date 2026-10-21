@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import type { AppUser } from '../../lib/api';
 import { RoleBadge } from '../ui/Badge';
 import EmptyState from '../ui/EmptyState';
@@ -9,12 +10,13 @@ interface UserTableProps {
   users:       AppUser[];
   loading:     boolean;
   emptyAction?: React.ReactNode;
+  onView?:     (user: AppUser) => void;
   onEdit?:     (user: AppUser) => void;
   onDelete?:   (user: AppUser) => void;
 }
 
 export default function UserTable({
-  users, loading, emptyAction, onEdit, onDelete,
+  users, loading, emptyAction, onView, onEdit, onDelete,
 }: UserTableProps) {
   if (loading) return <TableSkeleton rows={5} />;
 
@@ -30,7 +32,7 @@ export default function UserTable({
     );
   }
 
-  const showActions = Boolean(onEdit || onDelete);
+  const showActions = Boolean(onEdit || onDelete || onView);
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden animate-fade-in">
@@ -59,15 +61,29 @@ export default function UserTable({
           </thead>
           <tbody className="divide-y divide-[var(--border)]">
             {users.map((user) => (
-              <tr key={user.id} className="hover:bg-[var(--surface-2)] transition-colors">
+              <tr
+                key={user.id}
+                className="hover:bg-[var(--surface-2)] transition-colors cursor-pointer"
+                onClick={() => onView?.(user)}
+              >
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-3">
                     <div className="w-8 h-8 rounded-full bg-[var(--accent)] flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
                       {user.firstName.charAt(0).toUpperCase()}
                     </div>
-                    <span className="font-medium text-[var(--text-primary)]">
-                      {user.firstName} {user.lastName}
-                    </span>
+                    {onView ? (
+                      <Link
+                        href={`/supervisor/users/${user.id}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="font-medium text-[var(--accent)] hover:underline"
+                      >
+                        {user.firstName} {user.lastName}
+                      </Link>
+                    ) : (
+                      <span className="font-medium text-[var(--text-primary)]">
+                        {user.firstName} {user.lastName}
+                      </span>
+                    )}
                   </div>
                 </td>
                 <td className="px-4 py-3 text-[var(--text-secondary)]">{user.email}</td>
@@ -83,8 +99,16 @@ export default function UserTable({
                   )}
                 </td>
                 {showActions && (
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                     <div className="flex items-center justify-end gap-2">
+                      {onView && (
+                        <Link
+                          href={`/supervisor/users/${user.id}`}
+                          className="px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--accent-subtle)] transition-colors"
+                        >
+                          View
+                        </Link>
+                      )}
                       {onEdit && (
                         <button
                           type="button"

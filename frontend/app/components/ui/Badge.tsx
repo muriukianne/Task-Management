@@ -1,17 +1,20 @@
-import type { Priority, TaskStatus, UserRole } from '../../lib/api';
+import type { Priority, UserRole } from '../../lib/api';
+import type { DueUrgency } from '../../lib/dueDate';
+import { formatDueLabel, getDueUrgency } from '../../lib/dueDate';
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
-const STATUS_CFG: Record<TaskStatus, { label: string; cls: string }> = {
-  created:     { label: 'Created',     cls: 'bg-slate-100   text-slate-700   dark:bg-slate-800  dark:text-slate-300' },
-  assigned:    { label: 'Assigned',    cls: 'bg-blue-100    text-blue-700    dark:bg-blue-900/40 dark:text-blue-300' },
-  in_progress: { label: 'In Progress', cls: 'bg-amber-100   text-amber-700   dark:bg-amber-900/40 dark:text-amber-300' },
-  resolved:    { label: 'Resolved',    cls: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300' },
-  done:        { label: 'Done',        cls: 'bg-violet-100  text-violet-700  dark:bg-violet-900/40 dark:text-violet-300' },
+const STATUS_CFG: Record<string, { label: string; cls: string }> = {
+  created:           { label: 'Created',           cls: 'bg-slate-100   text-slate-700   dark:bg-slate-800  dark:text-slate-300' },
+  assigned:          { label: 'Assigned',          cls: 'bg-blue-100    text-blue-700    dark:bg-blue-900/40 dark:text-blue-300' },
+  in_progress:       { label: 'In Progress',       cls: 'bg-amber-100   text-amber-700   dark:bg-amber-900/40 dark:text-amber-300' },
+  pending_approval:  { label: 'Pending approval',  cls: 'bg-orange-100  text-orange-800  dark:bg-orange-900/40 dark:text-orange-300' },
+  resolved:          { label: 'Resolved',          cls: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300' },
+  done:              { label: 'Done',              cls: 'bg-violet-100  text-violet-700  dark:bg-violet-900/40 dark:text-violet-300' },
 };
 
 export function StatusBadge({ status }: { status: string }) {
-  const cfg = STATUS_CFG[status as TaskStatus] ?? { label: status, cls: 'bg-slate-100 text-slate-700' };
+  const cfg = STATUS_CFG[status] ?? { label: status, cls: 'bg-slate-100 text-slate-700' };
   return (
     <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cfg.cls}`}>
       {cfg.label}
@@ -67,6 +70,89 @@ export function RoleBadge({ role }: { role: string }) {
   return (
     <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold capitalize ${cfg.cls}`}>
       {role}
+    </span>
+  );
+}
+
+// ── Due date urgency ──────────────────────────────────────────────────────────
+
+const DUE_CFG: Record<Exclude<DueUrgency, 'none' | 'upcoming'>, { label: string; cls: string }> = {
+  soon: {
+    label: 'Due soon',
+    cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  },
+  today: {
+    label: 'Due today',
+    cls: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300',
+  },
+  overdue: {
+    label: 'Overdue',
+    cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
+  },
+};
+
+export function DueBadge({
+  dueDate,
+  status,
+  showDate = true,
+}: {
+  dueDate: string | null | undefined;
+  status?: string | null;
+  showDate?: boolean;
+}) {
+  if (!dueDate) {
+    return showDate ? <span className="text-[var(--text-muted)]">—</span> : null;
+  }
+  const urgency = getDueUrgency(dueDate, status);
+  const dateLabel = formatDueLabel(dueDate);
+
+  if (urgency === 'none' || urgency === 'upcoming') {
+    return (
+      <span className="text-sm text-[var(--text-secondary)]">{dateLabel}</span>
+    );
+  }
+
+  const cfg = DUE_CFG[urgency];
+  return (
+    <span className="inline-flex flex-col items-start gap-0.5">
+      {showDate && (
+        <span className={`text-sm font-semibold ${
+          urgency === 'overdue' ? 'text-red-600 dark:text-red-400'
+            : urgency === 'today' ? 'text-orange-600 dark:text-orange-400'
+              : 'text-amber-700 dark:text-amber-300'
+        }`}>
+          {dateLabel}
+        </span>
+      )}
+      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold ${cfg.cls}`}>
+        {cfg.label}
+      </span>
+    </span>
+  );
+}
+
+// ── Audit action ──────────────────────────────────────────────────────────────
+
+const ACTION_CFG: Record<string, { label: string; cls: string }> = {
+  TASK_CREATED:     { label: 'Task created',     cls: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' },
+  TASK_REJECTED:    { label: 'Task rejected',    cls: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300' },
+  STATUS_CHANGED:   { label: 'Status changed',   cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  ASSIGNEE_CHANGED: { label: 'Assignee changed', cls: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300' },
+  FILE_UPLOADED:    { label: 'File uploaded',    cls: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300' },
+  COMMENT_ADDED:    { label: 'Comment added',    cls: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
+  USER_CREATED:     { label: 'User created',     cls: 'bg-teal-100 text-teal-800 dark:bg-teal-900/40 dark:text-teal-300' },
+  USER_UPDATED:     { label: 'User updated',     cls: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300' },
+  USER_DELETED:     { label: 'User deleted',     cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+};
+
+export function ActionBadge({ action }: { action: string }) {
+  const cfg = ACTION_CFG[action] ?? {
+    label: action.replaceAll('_', ' ').toLowerCase(),
+    cls: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
+  };
+  return (
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cfg.cls}`}>
+      {cfg.label}
     </span>
   );
 }

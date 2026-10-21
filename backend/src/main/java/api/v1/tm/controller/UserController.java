@@ -2,6 +2,7 @@ package api.v1.tm.controller;
 
 import api.v1.tm.dtos.requests.CreateUserRequest;
 import api.v1.tm.dtos.requests.SyncUserRequest;
+import api.v1.tm.dtos.requests.UpdateOwnProfileRequest;
 import api.v1.tm.dtos.requests.UpdateUserRequest;
 import api.v1.tm.dtos.responses.ApiResponse;
 import api.v1.tm.entity.AppUser;
@@ -45,9 +46,8 @@ public class UserController {
     @GET
     @Blocking
     @Authenticated
-    public Uni<Response> listUsers() {
-        return userService.getUsers()
-                .map(users -> Response.ok(ApiResponse.success(users)).build());
+    public Response listUsers() {
+        return Response.ok(ApiResponse.success(userService.getUsers())).build();
     }
 
     /** Legacy alias kept for older clients. */
@@ -55,7 +55,7 @@ public class UserController {
     @Path("/get-users")
     @Blocking
     @Authenticated
-    public Uni<Response> getUsers() {
+    public Response getUsers() {
         return listUsers();
     }
 
@@ -63,9 +63,20 @@ public class UserController {
     @Path("/{id}")
     @Blocking
     @Authenticated
-    public Uni<Response> getUser(@PathParam("id") Long id) {
-        return userService.getUser(id)
-                .map(user -> Response.ok(ApiResponse.success(user)).build());
+    public Response getUser(@PathParam("id") Long id) {
+        return Response.ok(ApiResponse.success(userService.getUser(id))).build();
+    }
+
+    @PUT
+    @Path("/me")
+    @Blocking
+    @Authenticated
+    public Uni<Response> updateOwnProfile(@Valid UpdateOwnProfileRequest request) {
+        return userService.updateOwnProfile(request)
+                .map(user -> {
+                    currentAppUser.set(user);
+                    return Response.ok(ApiResponse.success("Profile updated", user)).build();
+                });
     }
 
     @PUT
@@ -102,7 +113,7 @@ public class UserController {
     }
 
     /**
-     * Password-grant login via Supabase has been removed.
+     * Password-grant login against the legacy cloud database has been removed.
      * Clients must obtain a standard OIDC JWT from the identity provider and
      * send it as {@code Authorization: Bearer <token>} on API requests.
      */

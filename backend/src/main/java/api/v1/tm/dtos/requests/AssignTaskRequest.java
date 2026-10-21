@@ -10,7 +10,10 @@ public class AssignTaskRequest {
     @NotNull(message = "Task id is required")
     private Long taskId;
 
-    /** Immutable internal {@code app_users.id} of the assignee. */
-    @NotNull(message = "Assigned to is required")
+    /** New primary lead — immutable internal {@code app_users.id}. */
+    @NotNull(message = "Assigned to (lead) is required")
     private Long assignedTo;
+
+    /** Full co-assignee set to replace (employees). Lead must not be included. */
+    private java.util.List<Long> coAssignees;
 }

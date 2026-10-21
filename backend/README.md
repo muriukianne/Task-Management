@@ -1,74 +1,43 @@
-# techassesment
+# Backend — Quarkus Task Management API
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+Java 21 / Quarkus 3.31 REST API for the Task Management app. Runs exclusively
+against a **local PostgreSQL** instance; JWTs are validated via OIDC (Clerk) in
+dev/prod and via a **local RSA key pair** in tests (fully offline).
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+## Run in dev mode
 
-## Running the application in dev mode
-
-You can run your application in dev mode that enables live coding using:
-
-```shell script
-./mvnw quarkus:dev
+```bash
+cp .env.example .env          # then fill in local DB + OIDC values
+.\mvnw.cmd quarkus:dev        # Windows   |  ./mvnw quarkus:dev
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+- API base: `http://localhost:8080/tm/api/v1`
+- OpenAPI UI: `http://localhost:8080/q/swagger-ui`
 
-## Packaging and running the application
+The database schema must be created beforehand with the phased SQL scripts —
+see [`src/main/resources/db/README.md`](src/main/resources/db/README.md).
+Hibernate schema management is frozen at `none`; Dev Services are disabled.
 
-The application can be packaged using:
+## Tests
 
-```shell script
-./mvnw package
+```bash
+.\mvnw.cmd test               # 33 unit + integration tests, all offline
 ```
 
-It produces the `quarkus-run.jar` file in the `target/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `target/quarkus-app/lib/` directory.
+Requirements (one-time setup, documented in db/README.md):
 
-The application is now runnable using `java -jar target/quarkus-app/quarkus-run.jar`.
+1. Local `taskmanagement_test` database with the phase scripts applied.
+2. Test RSA key pair in `src/test/resources`
+   (`openssl genrsa -out test-private-key.pem 2048` + `openssl rsa -pubout`).
+   The private key is gitignored; integration tests mint JWTs with it
+   (`TestTokens`) while the app verifies against the committed public key.
 
-If you want to build an _über-jar_, execute the following command:
+## Packaging
 
-```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
+```bash
+.\mvnw.cmd package                 # → target/taskassesment-dev.jar (JVM mode)
+docker build -f src/main/docker/Dockerfile.jvm -t tm-backend .
 ```
 
-The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.
-
-## Creating a native executable
-
-You can create a native executable using:
-
-```shell script
-./mvnw package -Dnative
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./mvnw package -Dnative -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./target/techassesment-1.0.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/maven-tooling>.
-
-## Related Guides
-
-- REST ([guide](https://quarkus.io/guides/rest)): Build RESTful web services and APIs using Jakarta REST (formerly JAX-RS)
-- REST Client ([guide](https://quarkus.io/guides/rest-client)): Type-safe HTTP client for consuming REST APIs using MicroProfile REST Client
-- REST Jackson ([guide](https://quarkus.io/guides/rest#json-serialisation)): Jackson serialization support for Quarkus REST. This extension is not compatible with the quarkus-resteasy extension, or any of the extensions that depend on it
-
-## Provided Code
-
-### REST Client
-
-Invoke different services through REST with JSON
-
-[Related guide section...](https://quarkus.io/guides/rest-client)
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+Full quick start, architecture, and API overview: see the
+[root README](../README.md).

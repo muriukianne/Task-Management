@@ -8,7 +8,7 @@ import java.util.Set;
 public class TaskStatusValidator implements ConstraintValidator<ValidTaskStatus, String> {
 
     private static final Set<String> VALID = Set.of(
-            "created", "assigned", "in_progress", "resolved", "done");
+            "created", "assigned", "in_progress", "pending_approval", "resolved", "done");
 
     @Override
     public boolean isValid(String value, ConstraintValidatorContext ctx) {

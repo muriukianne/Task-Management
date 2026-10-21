@@ -6,8 +6,9 @@ import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 /**
- * Optional profile hints from the client (Clerk session) used when the JWT
- * template omits email / name claims. Never overrides an already-linked account.
+ * Optional name hints from the client (Clerk session) used when the JWT
+ * omits given/family name. {@code email} is accepted for backward compatibility
+ * but is never used as a join key — linking requires a verified JWT email claim.
  */
 @Data
 @RegisterForReflection

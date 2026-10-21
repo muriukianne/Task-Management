@@ -5,8 +5,9 @@ import { useRouter } from 'next/navigation';
 import { useAuth, useUser } from '@clerk/nextjs';
 import { decodeToken, getUserRoleFromToken } from '../lib/auth';
 import {
-  getTasks, getTask, getUsers, createTask, assignTask,
-  updateTaskStatus, createUser, updateUser, deleteUser, syncUser, ApiError,
+  getTask, getTasks, getUsers, createTask, assignTask,
+  updateTaskStatus, rejectTask, createUser, updateUser, deleteUser, syncUser, ApiError,
+  isStaleTaskError, requireTaskVersion, STALE_TASK_MESSAGE,
 } from '../lib/api';
 import type { Task, AppUser, UserRole, TaskStatus } from '../lib/api';
 import { useToast } from '../components/providers/ToastContext';
@@ -14,14 +15,16 @@ import DashboardLayout from '../components/layout/DashboardLayout';
 import TaskFilters from '../components/tasks/TaskFilters';
 import TaskTable from '../components/tasks/TaskTable';
 import TaskKanban from '../components/tasks/TaskKanban';
-import TaskDetail from '../components/tasks/TaskDetail';
+import RejectTaskModal from '../components/tasks/RejectTaskModal';
 import CreateTaskModal from '../components/tasks/CreateTaskModal';
 import CreateUserModal from '../components/users/CreateUserModal';
 import EditUserModal from '../components/users/EditUserModal';
 import UserTable from '../components/users/UserTable';
 import Modal from '../components/ui/Modal';
 import UserSelect from '../components/ui/UserSelect';
+import MultiUserSelect from '../components/ui/MultiUserSelect';
 import type { SortField, SortDir } from '../components/tasks/TaskFilters';
+import { getDueUrgency } from '../lib/dueDate';
 
 type Tab = 'tasks' | 'users';
 
@@ -87,6 +90,7 @@ export default function SupervisorPage() {
 
   const [statusFilter, setStatusFilter]     = useState('all');
   const [priorityFilter, setPriorityFilter] = useState('all');
+  const [dueFilter, setDueFilter]           = useState('all');
   const [sortField, setSortField]           = useState<SortField>('updatedAt');
   const [sortDir, setSortDir]               = useState<SortDir>('desc');
   const [viewMode, setViewMode]             = useState<'table' | 'kanban'>('table');
@@ -97,13 +101,13 @@ export default function SupervisorPage() {
   const [deleteUserTarget, setDeleteUserTarget] = useState<AppUser | null>(null);
   const [deletingUser, setDeletingUser]     = useState(false);
 
-  const [detailOpen, setDetailOpen]       = useState(false);
-  const [detailTask, setDetailTask]       = useState<Task | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-
   const [reAssignTask, setReAssignTask] = useState<Task | null>(null);
   const [reAssignTo, setReAssignTo]     = useState<number | ''>('');
+  const [reAssignCos, setReAssignCos]   = useState<number[]>([]);
   const [reAssigning, setReAssigning]   = useState(false);
+  const [rejectTaskTarget, setRejectTaskTarget] = useState<Task | null>(null);
+  const [rejecting, setRejecting] = useState(false);
+  const [busyTaskId, setBusyTaskId] = useState<number | null>(null);
 
   useEffect(() => {
     if (!isLoaded || !clerkUserLoaded) return;
@@ -174,78 +178,109 @@ export default function SupervisorPage() {
     setUsersLoading(true);
     const errors: string[] = [];
 
-    try {
-      const taskResult = await getTasks({ size: 100 });
-      setTasks(taskResult.content);
-    } catch (err: unknown) {
+    const [taskOutcome, userOutcome] = await Promise.allSettled([
+      getTasks({ size: 100 }),
+      getUsers(),
+    ]);
+
+    if (taskOutcome.status === 'fulfilled') {
+      setTasks(taskOutcome.value.content);
+    } else {
+      const err = taskOutcome.reason;
       errors.push(err instanceof Error ? err.message : 'Could not load tasks.');
-    } finally {
-      setLoading(false);
     }
 
-    try {
-      const userResult = await getUsers();
-      setUsers(userResult);
-    } catch (err: unknown) {
+    if (userOutcome.status === 'fulfilled') {
+      setUsers(userOutcome.value);
+    } else {
+      const err = userOutcome.reason;
       errors.push(err instanceof Error ? err.message : 'Could not load team.');
-    } finally {
-      setUsersLoading(false);
     }
+
+    setLoading(false);
+    setUsersLoading(false);
 
     if (errors.length) {
       toast.error('Load failed', errors.join(' '));
     }
   }, [toast]);
 
-  async function handleOpenDetail(task: Task) {
-    setDetailTask(task);
-    setDetailOpen(true);
-    setDetailLoading(true);
+  async function refreshTaskInList(taskId: number) {
     try {
-      const fresh = await getTask(task.taskId);
-      setDetailTask(fresh);
+      const fresh = await getTask(taskId);
+      setTasks((prev) => prev.map((t) => (t.taskId === taskId ? fresh : t)));
     } catch {
-      // keep existing data
-    } finally {
-      setDetailLoading(false);
+      await fetchAll();
     }
   }
 
   async function handleStatusUp(task: Task, newStatus: string) {
+    if (busyTaskId != null) return;
+
     const previous = task;
     const optimistic = { ...task, status: newStatus as TaskStatus };
 
+    setBusyTaskId(task.taskId);
     setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
-    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
 
     try {
-      const updated = await updateTaskStatus(task.taskId, newStatus);
+      const updated = await updateTaskStatus(task.taskId, newStatus, requireTaskVersion(task));
       toast.success('Status updated', `"${task.taskTitle}" → ${newStatus.replace('_', ' ')}.`);
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
     } catch (err: unknown) {
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
-      toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
+      if (isStaleTaskError(err)) {
+        toast.error('Update conflict', STALE_TASK_MESSAGE);
+        await refreshTaskInList(task.taskId);
+      } else {
+        toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
+      }
+    } finally {
+      setBusyTaskId(null);
     }
   }
 
   async function handleConfirmDone(task: Task) {
+    if (busyTaskId != null) return;
+
     const previous = task;
     const optimistic = { ...task, status: 'done' as TaskStatus };
 
+    setBusyTaskId(task.taskId);
     setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
-    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
 
     try {
-      const updated = await updateTaskStatus(task.taskId, 'done');
+      const updated = await updateTaskStatus(task.taskId, 'done', requireTaskVersion(task));
       toast.success('Task completed', `"${task.taskTitle}" marked as done.`);
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
     } catch (err: unknown) {
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
-      toast.error('Failed', err instanceof Error ? err.message : 'Could not confirm task.');
+      if (isStaleTaskError(err)) {
+        toast.error('Update conflict', STALE_TASK_MESSAGE);
+        await refreshTaskInList(task.taskId);
+      } else {
+        toast.error('Failed', err instanceof Error ? err.message : 'Could not confirm task.');
+      }
+    } finally {
+      setBusyTaskId(null);
+    }
+  }
+
+  async function handleRejectTask(task: Task, reason: string) {
+    setRejecting(true);
+    try {
+      const updated = await rejectTask(task.taskId, reason);
+      toast.success('Task rejected', `"${task.taskTitle}" returned to In Progress.`);
+      setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
+      setRejectTaskTarget(null);
+    } catch (err: unknown) {
+      const message = err instanceof ApiError
+        ? err.message
+        : (err instanceof Error ? err.message : 'Could not reject task.');
+      toast.error('Reject failed', message);
+      throw err instanceof Error ? err : new Error(message);
+    } finally {
+      setRejecting(false);
     }
   }
 
@@ -253,6 +288,8 @@ export default function SupervisorPage() {
     taskTitle: string;
     taskDescription: string;
     assignedTo: number;
+    coAssignees?: number[];
+    dependsOnTaskIds?: number[];
     priority: string;
     dueDate?: string;
   }) {
@@ -266,9 +303,13 @@ export default function SupervisorPage() {
     if (!reAssignTask || typeof reAssignTo !== 'number') return;
     setReAssigning(true);
     try {
-      const updated = await assignTask(reAssignTask.taskId, reAssignTo);
+      const updated = await assignTask(reAssignTask.taskId, reAssignTo, reAssignCos);
       const member  = users.find((u) => u.id === reAssignTo);
-      toast.success('Task reassigned', `Assigned to ${member ? `${member.firstName} ${member.lastName}` : `#${reAssignTo}`}.`);
+      const coLabel = reAssignCos.length ? ` (+${reAssignCos.length} co)` : '';
+      toast.success(
+        'Task reassigned',
+        `Lead: ${member ? `${member.firstName} ${member.lastName}` : `#${reAssignTo}`}${coLabel}.`,
+      );
       setTasks((prev) => prev.map((t) => (t.taskId === reAssignTask.taskId ? updated : t)));
       setReAssignTask(null);
     } catch (err: unknown) {
@@ -315,6 +356,34 @@ export default function SupervisorPage() {
     }
   }
 
+  async function syncClerkAfterEdit(
+    member: AppUser,
+    data: { firstName: string; lastName: string; email: string; role: string },
+  ) {
+    try {
+      const res = await fetch('/api/clerk/update-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clerkId: member.clerkId,
+          firstName: data.firstName,
+          lastName: data.lastName,
+          role: data.role,
+        }),
+      });
+      const json = await res.json() as { ok?: boolean; skipped?: boolean; error?: string };
+      if (!res.ok) {
+        toast.error('Clerk sync failed', json.error || 'Local profile saved; Clerk was not updated.');
+        return;
+      }
+      if (!json.skipped) {
+        toast.success('Clerk synced', 'Sign-in profile and role were updated in Clerk.');
+      }
+    } catch {
+      toast.error('Clerk sync failed', 'Local profile saved; Clerk was not updated.');
+    }
+  }
+
   async function handleConfirmDeleteUser() {
     if (!deleteUserTarget) return;
     setDeletingUser(true);
@@ -340,6 +409,8 @@ export default function SupervisorPage() {
     taskTitle: string;
     taskDescription: string;
     assignedTo: number;
+    coAssignees?: number[];
+    dependsOnTaskIds?: number[];
     priority: string;
     dueDate?: string;
   }) {
@@ -361,17 +432,34 @@ export default function SupervisorPage() {
   const filteredTasks = tasks.filter((t) => {
     if (statusFilter   !== 'all' && t.status   !== statusFilter)   return false;
     if (priorityFilter !== 'all' && t.priority !== priorityFilter) return false;
+    if (dueFilter === 'none') {
+      if (t.dueDate) return false;
+    } else if (dueFilter !== 'all') {
+      const urgency = getDueUrgency(t.dueDate, t.status);
+      if (dueFilter === 'soon') {
+        if (urgency !== 'soon' && urgency !== 'today') return false;
+      } else if (urgency !== dueFilter) {
+        return false;
+      }
+    }
     return true;
   });
   const sortedTasks = sortTasks(filteredTasks, sortField, sortDir);
+
+  const overdueCount = tasks.filter((t) => getDueUrgency(t.dueDate, t.status) === 'overdue').length;
+  const dueSoonCount = tasks.filter((t) => {
+    const u = getDueUrgency(t.dueDate, t.status);
+    return u === 'soon' || u === 'today';
+  }).length;
 
   const STATS = [
     { s: 'all',         label: 'Total',       value: tasks.length },
     { s: 'created',     label: 'Created',     value: tasks.filter((t) => t.status === 'created').length },
     { s: 'assigned',    label: 'Assigned',    value: tasks.filter((t) => t.status === 'assigned').length },
-    { s: 'in_progress', label: 'In Progress', value: tasks.filter((t) => t.status === 'in_progress').length },
-    { s: 'resolved',    label: 'Resolved',    value: resolvedCount },
-    { s: 'done',        label: 'Done',        value: tasks.filter((t) => t.status === 'done').length },
+    { s: 'in_progress',      label: 'In Progress',      value: tasks.filter((t) => t.status === 'in_progress').length },
+    { s: 'pending_approval', label: 'Pending approval', value: tasks.filter((t) => t.status === 'pending_approval').length },
+    { s: 'resolved',         label: 'Resolved',         value: resolvedCount },
+    { s: 'done',             label: 'Done',             value: tasks.filter((t) => t.status === 'done').length },
   ] as const;
 
   const headerActions = (
@@ -406,20 +494,40 @@ export default function SupervisorPage() {
       userEmail={userEmail}
       pageTitle={callerRole === 'admin' ? 'Admin Dashboard' : 'Supervisor Dashboard'}
       actions={headerActions}
+      notificationsEnabled={ready}
+      onNotificationTask={(taskId) => router.push(`/supervisor/tasks/${taskId}`)}
     >
       <div className="space-y-6">
 
         {/* Stats row */}
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+        <div className="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-9 gap-3">
           {STATS.map(({ s, label, value }) => (
             <StatCard
               key={s}
               label={label}
               value={value}
-              active={tab === 'tasks' && statusFilter === s}
-              onClick={() => { setTab('tasks'); setStatusFilter(s); }}
+              active={tab === 'tasks' && statusFilter === s && dueFilter === 'all'}
+              onClick={() => { setTab('tasks'); setStatusFilter(s); setDueFilter('all'); }}
             />
           ))}
+          <StatCard
+            label="Overdue"
+            value={overdueCount}
+            active={tab === 'tasks' && dueFilter === 'overdue'}
+            onClick={() => {
+              setTab('tasks');
+              setDueFilter(dueFilter === 'overdue' ? 'all' : 'overdue');
+            }}
+          />
+          <StatCard
+            label="Due soon"
+            value={dueSoonCount}
+            active={tab === 'tasks' && dueFilter === 'soon'}
+            onClick={() => {
+              setTab('tasks');
+              setDueFilter(dueFilter === 'soon' ? 'all' : 'soon');
+            }}
+          />
         </div>
 
         {/* Resolved alert */}
@@ -437,6 +545,24 @@ export default function SupervisorPage() {
               className="text-xs font-semibold text-amber-700 dark:text-amber-400 hover:underline whitespace-nowrap"
             >
               Review now
+            </button>
+          </div>
+        )}
+
+        {overdueCount > 0 && dueFilter !== 'overdue' && (
+          <div className="flex items-center gap-3 rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3">
+            <svg className="w-4 h-4 text-red-500 flex-shrink-0" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+              <path d="M8 5v3.5M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="text-sm text-red-800 dark:text-red-300 font-medium flex-1">
+              <strong>{overdueCount}</strong> open task{overdueCount > 1 ? 's are' : ' is'} past due.
+            </p>
+            <button
+              onClick={() => { setTab('tasks'); setDueFilter('overdue'); }}
+              className="text-xs font-semibold text-red-700 dark:text-red-400 hover:underline whitespace-nowrap"
+            >
+              View overdue
             </button>
           </div>
         )}
@@ -468,11 +594,13 @@ export default function SupervisorPage() {
             <TaskFilters
               status={statusFilter}
               priority={priorityFilter}
+              dueFilter={dueFilter}
               sortField={sortField}
               sortDir={sortDir}
               viewMode={viewMode}
               onStatus={setStatusFilter}
               onPriority={setPriorityFilter}
+              onDueFilter={setDueFilter}
               onSort={(f, d) => { setSortField(f); setSortDir(d); }}
               onViewMode={setViewMode}
             />
@@ -485,10 +613,20 @@ export default function SupervisorPage() {
                 sortField={sortField}
                 sortDir={sortDir}
                 role={callerRole}
+                busyTaskId={busyTaskId}
                 onSort={(f, d) => { setSortField(f); setSortDir(d); }}
-                onRowClick={handleOpenDetail}
+                onRowClick={(task) => router.push(`/supervisor/tasks/${task.taskId}`)}
                 onConfirmDone={handleConfirmDone}
-                onReAssign={(task) => { setReAssignTask(task); setReAssignTo(task.assignedTo); }}
+                onReject={setRejectTaskTarget}
+                onReAssign={(task) => {
+                  setReAssignTask(task);
+                  setReAssignTo(task.assignedTo);
+                  setReAssignCos(
+                    (task.assignees ?? [])
+                      .filter((a) => a.role !== 'LEAD' && a.userId !== task.assignedTo)
+                      .map((a) => a.userId),
+                  );
+                }}
                 onStatusUp={handleStatusUp}
                 emptyAction={
                   <button
@@ -505,8 +643,10 @@ export default function SupervisorPage() {
                 users={users}
                 loading={loading}
                 role={callerRole}
-                onOpen={handleOpenDetail}
+                busyTaskId={busyTaskId}
+                onOpen={(task) => router.push(`/supervisor/tasks/${task.taskId}`)}
                 onConfirmDone={handleConfirmDone}
+                onReject={setRejectTaskTarget}
                 onStatusUp={handleStatusUp}
                 emptyAction={
                   <button
@@ -526,6 +666,7 @@ export default function SupervisorPage() {
           <UserTable
             users={visibleUsers}
             loading={usersLoading}
+            onView={(user) => router.push(`/supervisor/users/${user.id}`)}
             onEdit={setEditUser}
             onDelete={setDeleteUserTarget}
             emptyAction={
@@ -542,25 +683,18 @@ export default function SupervisorPage() {
 
       {/* ── Modals ── */}
 
-      <TaskDetail
-        task={detailTask}
-        users={users}
-        loading={detailLoading}
-        role={callerRole}
-        open={detailOpen}
-        onClose={() => setDetailOpen(false)}
-        onConfirmDone={(task) => { handleConfirmDone(task); setDetailOpen(false); }}
-        onReAssign={(task) => {
-          setReAssignTask(task);
-          setReAssignTo(task.assignedTo);
-          setDetailOpen(false);
-        }}
-        onStatusUp={handleStatusUp}
+      <RejectTaskModal
+        task={rejectTaskTarget}
+        open={rejectTaskTarget != null}
+        busy={rejecting}
+        onClose={() => setRejectTaskTarget(null)}
+        onConfirm={handleRejectTask}
       />
 
       <CreateTaskModal
         open={createTaskOpen}
         users={assignableUsers}
+        tasks={tasks}
         onClose={() => setCreateTaskOpen(false)}
         onSubmit={handleCreateTaskSafe}
       />
@@ -578,6 +712,7 @@ export default function SupervisorPage() {
         callerRole={callerRole}
         onClose={() => setEditUser(null)}
         onSubmit={handleUpdateUser}
+        onAfterSave={syncClerkAfterEdit}
       />
 
       <Modal
@@ -622,21 +757,36 @@ export default function SupervisorPage() {
         open={!!reAssignTask}
         onClose={() => setReAssignTask(null)}
         title="Reassign Task"
-        description={`Reassign "${reAssignTask?.taskTitle ?? ''}" to another team member.`}
+        description={`Update the lead and co-assignees for "${reAssignTask?.taskTitle ?? ''}".`}
         size="sm"
       >
         <form onSubmit={handleReAssign} className="space-y-5">
           <div>
             <label htmlFor="ra-user" className="block text-sm font-medium text-[var(--text-primary)] mb-1.5">
-              Assign To <span className="text-red-500">*</span>
+              Primary lead <span className="text-red-500">*</span>
             </label>
             <UserSelect
               id="ra-user"
               name="reAssignTo"
               users={assignableUsers}
               value={reAssignTo}
-              onChange={setReAssignTo}
+              onChange={(id) => {
+                setReAssignTo(id);
+                setReAssignCos((prev) => prev.filter((c) => c !== id));
+              }}
               required
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-[var(--text-primary)] mb-1.5">
+              Co-assignees
+            </label>
+            <MultiUserSelect
+              users={assignableUsers}
+              value={reAssignCos}
+              onChange={setReAssignCos}
+              excludeIds={typeof reAssignTo === 'number' ? [reAssignTo] : []}
             />
           </div>
 
@@ -659,7 +809,7 @@ export default function SupervisorPage() {
                     strokeDasharray="32" strokeDashoffset="32" strokeLinecap="round"/>
                 </svg>
               )}
-              {reAssigning ? 'Assigning…' : 'Reassign'}
+              {reAssigning ? 'Assigning…' : 'Save team'}
             </button>
           </div>
         </form>

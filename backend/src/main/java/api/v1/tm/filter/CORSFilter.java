@@ -22,7 +22,8 @@ public class CORSFilter {
 
     private static final String ALLOW_METHODS = "GET,POST,PUT,DELETE,OPTIONS,PATCH";
     private static final String ALLOW_HEADERS =
-            "Content-Type,Authorization,apikey,Accept,X-Requested-With";
+            "Content-Type,Authorization,apikey,Accept,X-Requested-With,X-Request-Id,X-Correlation-Id";
+    private static final String EXPOSE_HEADERS = "X-Request-Id,X-Correlation-Id";
 
     @ConfigProperty(name = "cors.allowed-origins", defaultValue = "http://localhost:3000")
     String allowedOriginsConfig;
@@ -43,6 +44,7 @@ public class CORSFilter {
                         .set("Access-Control-Allow-Origin",      origin)
                         .set("Access-Control-Allow-Methods",     ALLOW_METHODS)
                         .set("Access-Control-Allow-Headers",     ALLOW_HEADERS)
+                        .set("Access-Control-Expose-Headers",    EXPOSE_HEADERS)
                         .set("Access-Control-Allow-Credentials", "true")
                         .set("Access-Control-Max-Age",           "3600")
                         .set("Vary",                              "Origin");

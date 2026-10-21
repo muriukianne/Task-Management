@@ -4,15 +4,18 @@ import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth, useUser } from '@clerk/nextjs';
 import { decodeToken, getUserRoleFromToken } from '../lib/auth';
-import { getTasks, getTask, updateTaskStatus, syncUser } from '../lib/api';
+import {
+  getTask, getTasks, updateTaskStatus, syncUser,
+  isStaleTaskError, requireTaskVersion, STALE_TASK_MESSAGE,
+} from '../lib/api';
 import type { Task, AppUser, TaskStatus } from '../lib/api';
 import { useToast } from '../components/providers/ToastContext';
 import DashboardLayout from '../components/layout/DashboardLayout';
 import TaskFilters from '../components/tasks/TaskFilters';
 import TaskTable from '../components/tasks/TaskTable';
 import TaskKanban from '../components/tasks/TaskKanban';
-import TaskDetail from '../components/tasks/TaskDetail';
 import type { SortField, SortDir } from '../components/tasks/TaskFilters';
+import { getDueUrgency } from '../lib/dueDate';
 
 function StatCard({
   label,
@@ -49,7 +52,7 @@ function StatCard({
 function sortTasks(tasks: Task[], field: SortField, dir: SortDir): Task[] {
   const priorityOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
   const statusOrder: Record<string, number> = {
-    created: 1, assigned: 2, in_progress: 3, resolved: 4, done: 5,
+    created: 1, assigned: 2, in_progress: 3, pending_approval: 4, resolved: 5, done: 6,
   };
 
   return [...tasks].sort((a, b) => {
@@ -79,7 +82,8 @@ function sortTasks(tasks: Task[], field: SortField, dir: SortDir): Task[] {
 function clerkProfile(user: ReturnType<typeof useUser>['user']) {
   if (!user) return {};
   return {
-    email:     user.primaryEmailAddress?.emailAddress,
+    email:     user.primaryEmailAddress?.emailAddress
+      ?? user.emailAddresses?.[0]?.emailAddress,
     firstName: user.firstName ?? undefined,
     lastName:  user.lastName ?? undefined,
   };
@@ -113,13 +117,11 @@ export default function EmployeePage() {
 
   const [statusFilter, setStatusFilter]     = useState('all');
   const [priorityFilter, setPriorityFilter] = useState('all');
+  const [dueFilter, setDueFilter]           = useState('all');
   const [sortField, setSortField]           = useState<SortField>('updatedAt');
   const [sortDir, setSortDir]               = useState<SortDir>('desc');
   const [viewMode, setViewMode]             = useState<'table' | 'kanban'>('table');
 
-  const [detailOpen, setDetailOpen]       = useState(false);
-  const [detailTask, setDetailTask]       = useState<Task | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
   const [busyTaskId, setBusyTaskId]       = useState<number | null>(null);
 
   useEffect(() => {
@@ -199,20 +201,12 @@ export default function EmployeePage() {
     }
   }, [toast]);
 
-  async function handleOpenDetail(task: Task) {
-    setDetailTask(task);
-    setDetailOpen(true);
-    setDetailLoading(true);
+  async function refreshTaskInList(id: number) {
     try {
-      const fresh = await getTask(task.taskId);
-      setDetailTask(fresh);
-    } catch (err: unknown) {
-      toast.error(
-        'Could not open task',
-        err instanceof Error ? err.message : 'Task details unavailable.',
-      );
-    } finally {
-      setDetailLoading(false);
+      const fresh = await getTask(id);
+      setTasks((prev) => prev.map((t) => (t.taskId === id ? fresh : t)));
+    } catch {
+      await fetchTasks();
     }
   }
 
@@ -224,18 +218,20 @@ export default function EmployeePage() {
 
     setBusyTaskId(task.taskId);
     setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? optimistic : t)));
-    setDetailTask((curr) => (curr?.taskId === task.taskId ? optimistic : curr));
 
     try {
-      const updated = await updateTaskStatus(task.taskId, newStatus);
+      const updated = await updateTaskStatus(task.taskId, newStatus, requireTaskVersion(task));
       const label = newStatus === 'in_progress' ? 'in progress' : newStatus.replace('_', ' ');
       toast.success('Status updated', `"${task.taskTitle}" is now ${label}.`);
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? updated : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? updated : curr));
     } catch (err: unknown) {
       setTasks((prev) => prev.map((t) => (t.taskId === task.taskId ? previous : t)));
-      setDetailTask((curr) => (curr?.taskId === task.taskId ? previous : curr));
-      toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
+      if (isStaleTaskError(err)) {
+        toast.error('Update conflict', STALE_TASK_MESSAGE);
+        await refreshTaskInList(task.taskId);
+      } else {
+        toast.error('Update failed', err instanceof Error ? err.message : 'Could not update status.');
+      }
     } finally {
       setBusyTaskId(null);
     }
@@ -245,9 +241,15 @@ export default function EmployeePage() {
     total:      tasks.length,
     assigned:   tasks.filter((t) => t.status === 'assigned').length,
     inProgress: tasks.filter((t) => t.status === 'in_progress').length,
+    pendingApproval: tasks.filter((t) => t.status === 'pending_approval').length,
     // Employees finish work as "resolved"; supervisor then marks "done".
     // Both count as completed from the employee view.
     completed:  tasks.filter((t) => t.status === 'resolved' || t.status === 'done').length,
+    overdue:    tasks.filter((t) => getDueUrgency(t.dueDate, t.status) === 'overdue').length,
+    dueSoon:    tasks.filter((t) => {
+      const u = getDueUrgency(t.dueDate, t.status);
+      return u === 'soon' || u === 'today';
+    }).length,
   };
 
   const filtered = tasks.filter((t) => {
@@ -257,6 +259,16 @@ export default function EmployeePage() {
       return false;
     }
     if (priorityFilter !== 'all' && t.priority !== priorityFilter) return false;
+    if (dueFilter === 'none') {
+      if (t.dueDate) return false;
+    } else if (dueFilter !== 'all') {
+      const urgency = getDueUrgency(t.dueDate, t.status);
+      if (dueFilter === 'soon') {
+        if (urgency !== 'soon' && urgency !== 'today') return false;
+      } else if (urgency !== dueFilter) {
+        return false;
+      }
+    }
     return true;
   });
   const sorted = sortTasks(filtered, sortField, sortDir);
@@ -289,15 +301,17 @@ export default function EmployeePage() {
       userName={userName || 'Me'}
       userEmail={userEmail}
       pageTitle="My Tasks"
+      notificationsEnabled={ready}
+      onNotificationTask={(taskId) => router.push(`/employee/tasks/${taskId}`)}
     >
       <div className="space-y-6">
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-4">
           <StatCard
             label="Total"
             value={counts.total}
-            active={statusFilter === 'all'}
-            onClick={() => setStatusFilter('all')}
+            active={statusFilter === 'all' && dueFilter === 'all'}
+            onClick={() => { setStatusFilter('all'); setDueFilter('all'); }}
           />
           <StatCard
             label="Assigned"
@@ -313,13 +327,66 @@ export default function EmployeePage() {
             onClick={() => setStatusFilter('in_progress')}
           />
           <StatCard
+            label="Pending approval"
+            value={counts.pendingApproval}
+            accent={counts.pendingApproval > 0 && statusFilter !== 'pending_approval'}
+            active={statusFilter === 'pending_approval'}
+            onClick={() => setStatusFilter('pending_approval')}
+          />
+          <StatCard
             label="Completed"
             value={counts.completed}
             accent={counts.completed > 0 && statusFilter !== 'completed'}
             active={statusFilter === 'completed'}
             onClick={() => setStatusFilter('completed')}
           />
+          <StatCard
+            label="Overdue"
+            value={counts.overdue}
+            accent={counts.overdue > 0 && dueFilter !== 'overdue'}
+            active={dueFilter === 'overdue'}
+            onClick={() => setDueFilter(dueFilter === 'overdue' ? 'all' : 'overdue')}
+          />
+          <StatCard
+            label="Due soon"
+            value={counts.dueSoon}
+            accent={counts.dueSoon > 0 && dueFilter !== 'soon'}
+            active={dueFilter === 'soon'}
+            onClick={() => setDueFilter(dueFilter === 'soon' ? 'all' : 'soon')}
+          />
         </div>
+
+        {counts.pendingApproval > 0 && statusFilter !== 'pending_approval' && (
+          <button
+            type="button"
+            onClick={() => setStatusFilter('pending_approval')}
+            className="flex items-center gap-3 rounded-xl bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 px-4 py-3 w-full text-left hover:border-orange-400 transition-colors"
+          >
+            <svg className="w-4 h-4 text-orange-500 flex-shrink-0" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+              <path d="M8 5v3.5M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="text-sm text-orange-800 dark:text-orange-300 font-medium">
+              <strong>{counts.pendingApproval}</strong> task{counts.pendingApproval > 1 ? 's await' : ' awaits'} lead approval.
+            </p>
+          </button>
+        )}
+
+        {counts.overdue > 0 && dueFilter !== 'overdue' && (
+          <button
+            type="button"
+            onClick={() => setDueFilter('overdue')}
+            className="flex items-center gap-3 rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 w-full text-left hover:border-red-400 transition-colors"
+          >
+            <svg className="w-4 h-4 text-red-500 flex-shrink-0" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+              <path d="M8 5v3.5M8 11h.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="text-sm text-red-800 dark:text-red-300 font-medium">
+              <strong>{counts.overdue}</strong> task{counts.overdue > 1 ? 's are' : ' is'} past due.
+            </p>
+          </button>
+        )}
 
         {counts.assigned > 0 && statusFilter !== 'assigned' && (
           <button
@@ -340,12 +407,14 @@ export default function EmployeePage() {
         <TaskFilters
           status={statusFilter}
           priority={priorityFilter}
+          dueFilter={dueFilter}
           sortField={sortField}
           sortDir={sortDir}
           viewMode={viewMode}
           role="employee"
           onStatus={setStatusFilter}
           onPriority={setPriorityFilter}
+          onDueFilter={setDueFilter}
           onSort={(f, d) => { setSortField(f); setSortDir(d); }}
           onViewMode={setViewMode}
         />
@@ -360,7 +429,7 @@ export default function EmployeePage() {
             role="employee"
             busyTaskId={busyTaskId}
             onSort={(f, d) => { setSortField(f); setSortDir(d); }}
-            onRowClick={handleOpenDetail}
+            onRowClick={(task) => router.push(`/employee/tasks/${task.taskId}`)}
             onConfirmDone={() => {}}
             onReAssign={() => {}}
             onStatusUp={handleStatusUp}
@@ -373,25 +442,12 @@ export default function EmployeePage() {
             loading={loading}
             role="employee"
             busyTaskId={busyTaskId}
-            onOpen={handleOpenDetail}
+            onOpen={(task) => router.push(`/employee/tasks/${task.taskId}`)}
             onConfirmDone={() => {}}
             onStatusUp={handleStatusUp}
             emptyDescription="No tasks match these filters. Try All, or wait for your supervisor to assign work."
           />
         )}
-
-        <TaskDetail
-          task={detailTask}
-          users={selfUser}
-          loading={detailLoading}
-          role="employee"
-          open={detailOpen}
-          busy={busyTaskId != null && detailTask?.taskId === busyTaskId}
-          onClose={() => setDetailOpen(false)}
-          onConfirmDone={() => {}}
-          onReAssign={() => {}}
-          onStatusUp={handleStatusUp}
-        />
       </div>
     </DashboardLayout>
   );

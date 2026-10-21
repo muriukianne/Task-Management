@@ -1,7 +1,7 @@
 -- Phase 2: Immutable internal user IDs + nullable clerk_id
 -- Safe to re-run: skips when app_users already has bigint "id" PK.
 --
--- Run against your PostgreSQL (Aiven) before starting the backend with the new entities:
+-- Run against your local PostgreSQL before starting the backend with the new entities:
 --   psql "$DATABASE_URL" -f backend/src/main/resources/db/phase2-immutable-user-ids.sql
 
 BEGIN;
@@ -21,12 +21,13 @@ BEGIN
     RETURN;
   END IF;
 
-  -- Fresh DB with no app_users: Hibernate update will create the new schema
+  -- Fresh DB with no app_users: restore a baseline dump first (Hibernate
+  -- schema strategy is `none` and will not create tables).
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.tables
     WHERE table_schema = 'public' AND table_name = 'app_users'
   ) THEN
-    RAISE NOTICE 'No app_users table — skipping (Hibernate will create new schema)';
+    RAISE NOTICE 'No app_users table — skipping (restore baseline schema first; Hibernate will not create it)';
     RETURN;
   END IF;
 

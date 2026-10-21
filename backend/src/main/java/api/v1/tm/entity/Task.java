@@ -1,11 +1,16 @@
 package api.v1.tm.entity;
 
+import api.v1.tm.dtos.responses.TaskAssigneeResponse;
+import api.v1.tm.dtos.responses.TaskDependencyResponse;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.persistence.*;
 import lombok.*;
 
 import java.io.Serial;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 @Table(
     name = "tasks",
@@ -51,7 +56,7 @@ public class Task {
     @Column(name = "due_date")
     private LocalDate dueDate;
 
-    /** Immutable {@link AppUser#id} of the assignee. */
+    /** Primary lead — immutable {@link AppUser#id}. Mirrored as LEAD in task_assignees. */
     @Column(name = "assigned_to", nullable = false)
     private Long assignedTo;
 
@@ -62,9 +67,55 @@ public class Task {
     @Column(name = "attached_file")
     private String attachedFile;
 
+    /**
+     * Optimistic concurrency token. Incremented on every successful update.
+     * Clients should send the last-seen value on mutating requests so stale writes
+     * fail with HTTP 409 instead of silently overwriting concurrent changes.
+     */
+    @Version
+    @Column(name = "version", nullable = false)
+    @Builder.Default
+    private Integer version = 0;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
+
+    /**
+     * When a co-assignee submits work for lead review ({@code pending_approval}),
+     * stores the co-assignee's user id. Cleared when lead approves or sends back.
+     */
+    @Column(name = "approval_requested_by")
+    private Long approvalRequestedBy;
+
+    /** Populated for API responses — lead + co-assignees. */
+    @Transient
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    @Builder.Default
+    private List<TaskAssigneeResponse> assignees = new ArrayList<>();
+
+    /**
+     * Caller's role on this task for the current request: {@code LEAD}, {@code CO_ASSIGNEE}, or null.
+     */
+    @Transient
+    private String viewerAssigneeRole;
+
+    /** Tasks this one depends on (must be resolved/done before start). */
+    @Transient
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    @Builder.Default
+    private List<TaskDependencyResponse> dependencies = new ArrayList<>();
+
+    /** Tasks blocked by this one. */
+    @Transient
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    @Builder.Default
+    private List<TaskDependencyResponse> dependents = new ArrayList<>();
+
+    /** True when any dependency is not yet resolved/done. */
+    @Transient
+    @Builder.Default
+    private boolean blocked = false;
 }

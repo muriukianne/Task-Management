@@ -10,7 +10,7 @@ import java.lang.annotation.*;
 @Target({ElementType.FIELD, ElementType.PARAMETER})
 @Retention(RetentionPolicy.RUNTIME)
 public @interface ValidTaskStatus {
-    String message() default "Invalid status. Allowed: created, assigned, in_progress, resolved, done";
+    String message() default "Invalid status. Allowed: created, assigned, in_progress, pending_approval, resolved, done";
     Class<?>[] groups() default {};
     Class<? extends Payload>[] payload() default {};
 }

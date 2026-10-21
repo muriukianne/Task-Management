@@ -10,7 +10,10 @@ import java.util.Optional;
 public class UserRepository implements PanacheRepositoryBase<AppUser, Long> {
 
     public Optional<AppUser> findByEmail(String email) {
-        return find("email", email).firstResultOptional();
+        if (email == null || email.isBlank()) {
+            return Optional.empty();
+        }
+        return find("lower(email) = ?1", email.trim().toLowerCase()).firstResultOptional();
     }
 
     public Optional<AppUser> findByClerkId(String clerkId) {

@@ -14,11 +14,15 @@ public class AppExceptionMapper implements ExceptionMapper<AppException> {
 
     @Override
     public Response toResponse(AppException ex) {
-        log.warn("Application exception [{}] status={}: {}",
-                ex.getClass().getSimpleName(), ex.getHttpStatus(), ex.getMessage());
+        log.warn("Application exception [{}] status={} errorCode={}: {}",
+                ex.getClass().getSimpleName(), ex.getHttpStatus(), ex.getErrorCode(), ex.getMessage());
         return Response.status(ex.getHttpStatus())
                 .type(MediaType.APPLICATION_JSON_TYPE)
-                .entity(ApiResponse.error(ex.getHttpStatus(), ex.getMessage()))
+                .entity(ApiResponse.error(
+                        ex.getHttpStatus(),
+                        ex.getErrorCode(),
+                        ex.getMessage(),
+                        ex.getClass().getSimpleName()))
                 .build();
     }
 }

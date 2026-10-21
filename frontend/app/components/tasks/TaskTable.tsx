@@ -1,7 +1,7 @@
 'use client';
 
 import type { Task, AppUser } from '../../lib/api';
-import { StatusBadge, PriorityBadge } from '../ui/Badge';
+import { StatusBadge, PriorityBadge, DueBadge } from '../ui/Badge';
 import EmptyState from '../ui/EmptyState';
 import { TableSkeleton } from '../ui/Skeleton';
 import type { SortField, SortDir } from './TaskFilters';
@@ -27,6 +27,7 @@ interface TaskTableProps {
   onSort:        (f: SortField, d: SortDir) => void;
   onRowClick:    (task: Task) => void;
   onConfirmDone: (task: Task) => void;
+  onReject?:     (task: Task) => void;
   onReAssign:    (task: Task) => void;
   onStatusUp:    (task: Task, status: string) => void;
   emptyAction?:  React.ReactNode;
@@ -36,6 +37,19 @@ interface TaskTableProps {
 function getUserName(users: AppUser[], id: number) {
   const u = users.find((x) => x.id === id);
   return u ? `${u.firstName} ${u.lastName}` : `#${id}`;
+}
+
+function teamLabel(task: Task, users: AppUser[]) {
+  const assignees = task.assignees ?? [];
+  if (assignees.length === 0) {
+    return getUserName(users, task.assignedTo);
+  }
+  const lead = assignees.find((a) => a.role === 'LEAD') ?? assignees[0];
+  const coCount = assignees.filter((a) => a.role !== 'LEAD').length;
+  const leadName = lead.firstName
+    ? `${lead.firstName} ${lead.lastName ?? ''}`.trim()
+    : getUserName(users, lead.userId);
+  return coCount > 0 ? `${leadName} +${coCount}` : leadName;
 }
 
 function fmt(d: string | null) {
@@ -50,7 +64,7 @@ function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
 
 export default function TaskTable({
   tasks, users, loading, sortField, sortDir, role, busyTaskId = null,
-  onSort, onRowClick, onConfirmDone, onReAssign, onStatusUp,
+  onSort, onRowClick, onConfirmDone, onReject, onReAssign, onStatusUp,
   emptyAction,
   emptyDescription = 'No tasks found. Create your first task to get started!',
 }: TaskTableProps) {
@@ -118,7 +132,8 @@ export default function TaskTable({
                       {task.taskTitle}
                     </p>
                     <p className="text-xs text-[var(--text-muted)] mt-0.5 truncate">
-                      {getUserName(users, task.assignedTo)}
+                      {teamLabel(task, users)}
+                      {task.blocked ? ' · blocked' : ''}
                     </p>
                   </button>
                 </td>
@@ -135,12 +150,8 @@ export default function TaskTable({
                   {fmt(task.updatedAt)}
                 </td>
 
-                <td className="px-4 py-3 whitespace-nowrap text-xs text-[var(--text-secondary)]">
-                  {task.dueDate
-                    ? <span className={new Date(task.dueDate) < new Date() ? 'text-red-500 font-semibold' : ''}>
-                        {fmt(task.dueDate)}
-                      </span>
-                    : '—'}
+                <td className="px-4 py-3 whitespace-nowrap">
+                  <DueBadge dueDate={task.dueDate} status={task.status} />
                 </td>
 
                 {/* Actions */}
@@ -148,17 +159,29 @@ export default function TaskTable({
                   <div className="flex items-center gap-1.5 justify-end flex-wrap">
                     {/* Supervisor/Admin actions */}
                     {(role === 'supervisor' || role === 'admin') && task.status === 'resolved' && (
-                      <button
-                        type="button"
-                        disabled={busyTaskId === task.taskId}
-                        onClick={() => onConfirmDone(task)}
-                        className="px-2.5 py-1 rounded-lg bg-emerald-500 text-white text-xs font-semibold hover:bg-emerald-600 transition-colors disabled:opacity-50"
-                      >
-                        Confirm Done
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          disabled={busyTaskId === task.taskId}
+                          onClick={() => onConfirmDone(task)}
+                          className="px-2.5 py-1 rounded-lg bg-emerald-500 text-white text-xs font-semibold hover:bg-emerald-600 transition-colors disabled:opacity-50"
+                        >
+                          Confirm Done
+                        </button>
+                        {onReject && (
+                          <button
+                            type="button"
+                            disabled={busyTaskId === task.taskId}
+                            onClick={() => onReject(task)}
+                            className="px-2.5 py-1 rounded-lg bg-orange-500 text-white text-xs font-semibold hover:bg-orange-600 transition-colors disabled:opacity-50"
+                          >
+                            Reject
+                          </button>
+                        )}
+                      </>
                     )}
                     {(role === 'supervisor' || role === 'admin') &&
-                     (task.status === 'created' || task.status === 'assigned') && (
+                     (task.status === 'created' || task.status === 'assigned' || task.status === 'resolved') && (
                       <button
                         type="button"
                         onClick={() => onReAssign(task)}
@@ -172,14 +195,25 @@ export default function TaskTable({
                     {role === 'employee' && task.status === 'assigned' && (
                       <button
                         type="button"
-                        disabled={busyTaskId === task.taskId}
+                        disabled={busyTaskId === task.taskId || Boolean(task.blocked)}
+                        title={task.blocked ? 'Blocked by unfinished dependencies' : undefined}
                         onClick={() => onStatusUp(task, 'in_progress')}
                         className="px-2.5 py-1 rounded-lg bg-amber-500 text-white text-xs font-semibold hover:bg-amber-600 transition-colors disabled:opacity-50"
                       >
-                        {busyTaskId === task.taskId ? '…' : 'Start'}
+                        {busyTaskId === task.taskId ? '…' : task.blocked ? 'Blocked' : 'Start'}
                       </button>
                     )}
-                    {role === 'employee' && task.status === 'in_progress' && (
+                    {role === 'employee' && task.status === 'in_progress' && task.viewerAssigneeRole === 'CO_ASSIGNEE' && (
+                      <button
+                        type="button"
+                        disabled={busyTaskId === task.taskId}
+                        onClick={() => onStatusUp(task, 'pending_approval')}
+                        className="px-2.5 py-1 rounded-lg bg-orange-500 text-white text-xs font-semibold hover:bg-orange-600 transition-colors disabled:opacity-50"
+                      >
+                        {busyTaskId === task.taskId ? '…' : 'Submit'}
+                      </button>
+                    )}
+                    {role === 'employee' && task.status === 'in_progress' && task.viewerAssigneeRole !== 'CO_ASSIGNEE' && (
                       <button
                         type="button"
                         disabled={busyTaskId === task.taskId}
@@ -188,6 +222,26 @@ export default function TaskTable({
                       >
                         {busyTaskId === task.taskId ? '…' : 'Resolve'}
                       </button>
+                    )}
+                    {role === 'employee' && task.status === 'pending_approval' && task.viewerAssigneeRole === 'LEAD' && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={busyTaskId === task.taskId}
+                          onClick={() => onStatusUp(task, 'resolved')}
+                          className="px-2.5 py-1 rounded-lg bg-emerald-500 text-white text-xs font-semibold hover:bg-emerald-600 transition-colors disabled:opacity-50"
+                        >
+                          {busyTaskId === task.taskId ? '…' : 'Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyTaskId === task.taskId}
+                          onClick={() => onStatusUp(task, 'in_progress')}
+                          className="px-2.5 py-1 rounded-lg border border-orange-300 text-orange-700 text-xs font-semibold hover:bg-orange-50 transition-colors disabled:opacity-50"
+                        >
+                          Send back
+                        </button>
+                      </>
                     )}
 
                     {/* Detail */}

@@ -1,0 +1,27 @@
+# Local PostgreSQL for end-to-end development.
+# Uses host port 5433 so it does not collide with a Windows Postgres on 5432.
+#
+#   docker compose up -d
+# Then point backend/.env at jdbc:postgresql://localhost:5433/taskmanagement
+# (or keep the default %dev URL if you created the DB on native Postgres :5432).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tm-postgres
+    environment:
+      POSTGRES_DB: taskmanagement
+      POSTGRES_USER: tm
+      POSTGRES_PASSWORD: tm
+    ports:
+      - "5433:5432"
+    volumes:
+      - tm_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tm -d taskmanagement"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tm_pg_data:

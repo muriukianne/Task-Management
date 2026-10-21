@@ -12,4 +12,14 @@ public abstract class AppException extends RuntimeException {
     public int getHttpStatus() {
         return httpStatus;
     }
+
+    public String getErrorCode() {
+        return switch (this) {
+            case ResourceNotFoundException ignored -> ErrorCodes.NOT_FOUND;
+            case AccessDeniedException ignored -> ErrorCodes.FORBIDDEN;
+            case ConflictException ignored -> ErrorCodes.CONFLICT;
+            case BusinessException ignored -> ErrorCodes.BUSINESS_ERROR;
+            default -> ErrorCodes.forHttpStatus(httpStatus);
+        };
+    }
 }

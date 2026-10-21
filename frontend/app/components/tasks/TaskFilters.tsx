@@ -8,6 +8,7 @@ export type SortDir   = 'asc' | 'desc';
 interface TaskFiltersProps {
   status:         string;
   priority:       string;
+  dueFilter?:     string;
   sortField:      SortField;
   sortDir:        SortDir;
   viewMode:       'table' | 'kanban';
@@ -15,17 +16,27 @@ interface TaskFiltersProps {
   role?:          string;
   onStatus:       (v: string) => void;
   onPriority:     (v: string) => void;
+  onDueFilter?:   (v: string) => void;
   onSort:         (field: SortField, dir: SortDir) => void;
   onViewMode:     (v: 'table' | 'kanban') => void;
 }
 
+const DUE_FILTERS: { value: string; label: string }[] = [
+  { value: 'all',     label: 'All due dates' },
+  { value: 'overdue', label: 'Overdue' },
+  { value: 'today',   label: 'Due today' },
+  { value: 'soon',    label: 'Due soon (3d)' },
+  { value: 'none',    label: 'No due date' },
+];
+
 const STATUSES: { value: TaskStatus | 'all'; label: string; employee?: boolean }[] = [
-  { value: 'all',         label: 'All',         employee: true },
-  { value: 'created',     label: 'Created' },
-  { value: 'assigned',    label: 'Assigned',    employee: true },
-  { value: 'in_progress', label: 'In Progress', employee: true },
-  { value: 'resolved',    label: 'Resolved',    employee: true },
-  { value: 'done',        label: 'Done',        employee: true },
+  { value: 'all',              label: 'All',              employee: true },
+  { value: 'created',          label: 'Created' },
+  { value: 'assigned',         label: 'Assigned',         employee: true },
+  { value: 'in_progress',      label: 'In Progress',      employee: true },
+  { value: 'pending_approval', label: 'Pending approval', employee: true },
+  { value: 'resolved',         label: 'Resolved',         employee: true },
+  { value: 'done',             label: 'Done',             employee: true },
 ];
 
 const PRIORITIES: { value: Priority | 'all'; label: string }[] = [
@@ -46,8 +57,8 @@ const SORT_OPTIONS: { value: SortField; label: string }[] = [
 ];
 
 export default function TaskFilters({
-  status, priority, sortField, sortDir,
-  viewMode, role, onStatus, onPriority, onSort, onViewMode,
+  status, priority, dueFilter = 'all', sortField, sortDir,
+  viewMode, role, onStatus, onPriority, onDueFilter, onSort, onViewMode,
 }: TaskFiltersProps) {
   const statuses = role === 'employee'
     ? STATUSES.filter((s) => s.employee)
@@ -75,6 +86,19 @@ export default function TaskFilters({
       </div>
 
       <div className="flex items-center gap-2 ml-auto flex-wrap">
+        {/* Due date urgency filter */}
+        {onDueFilter && (
+          <select
+            value={dueFilter}
+            onChange={(e) => onDueFilter(e.target.value)}
+            className="h-8 rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] text-xs px-2 pr-6 focus:outline-none focus:ring-2 focus:ring-[var(--accent)] focus:border-transparent"
+          >
+            {DUE_FILTERS.map(({ value, label }) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        )}
+
         {/* Priority filter */}
         <select
           value={priority}

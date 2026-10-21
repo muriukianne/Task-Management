@@ -26,6 +26,17 @@ const NAV: NavItem[] = [
     ),
   },
   {
+    href: '/supervisor/audit',
+    label: 'Audit Trail',
+    roles: ['admin', 'supervisor'],
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <path d="M4 3.5h10v11H4z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+        <path d="M6.5 7h5M6.5 10h5M6.5 13h3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+      </svg>
+    ),
+  },
+  {
     href: '/employee',
     label: 'My Tasks',
     roles: ['employee'],
@@ -35,7 +46,28 @@ const NAV: NavItem[] = [
       </svg>
     ),
   },
+  {
+    href: '/account',
+    label: 'Account',
+    roles: ['admin', 'supervisor', 'employee'],
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <circle cx="9" cy="6" r="3" stroke="currentColor" strokeWidth="1.5"/>
+        <path d="M3 15c0-2.8 2.7-5 6-5s6 2.2 6 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+      </svg>
+    ),
+  },
 ];
+
+function isNavActive(pathname: string, href: string, allHrefs: string[]): boolean {
+  if (pathname === href) return true;
+  // Prefer a more specific sibling (e.g. /supervisor/audit over /supervisor)
+  const hasMoreSpecific = allHrefs.some(
+    (other) => other !== href && other.startsWith(href + '/') && pathname.startsWith(other),
+  );
+  if (hasMoreSpecific) return false;
+  return href !== '/' && pathname.startsWith(href + '/');
+}
 
 interface SidebarProps {
   role: UserRole;
@@ -84,6 +116,7 @@ export default function Sidebar({
   const { signOut } = useClerk();
 
   const navItems = NAV.filter((n) => n.roles.includes(role));
+  const navHrefs = navItems.map((n) => n.href);
 
   async function handleSignOut() {
     await signOut();
@@ -127,7 +160,7 @@ export default function Sidebar({
       {/* Nav */}
       <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto">
         {navItems.map((item) => {
-          const active = pathname.startsWith(item.href);
+          const active = isNavActive(pathname, item.href, navHrefs);
           return (
             <button
               key={item.href}

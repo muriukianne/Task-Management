@@ -1,18 +1,23 @@
 'use client';
 
-import { FormEvent, useEffect, useRef, useState } from 'react';
-import type { AppUser } from '../../lib/api';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import type { AppUser, Task } from '../../lib/api';
 import Modal from '../ui/Modal';
 import UserSelect from '../ui/UserSelect';
+import MultiUserSelect from '../ui/MultiUserSelect';
 
 interface CreateTaskModalProps {
   open:    boolean;
   users:   AppUser[];
+  /** Existing tasks for dependency picker (optional). */
+  tasks?:  Task[];
   onClose: () => void;
   onSubmit: (data: {
     taskTitle:       string;
     taskDescription: string;
     assignedTo:      number;
+    coAssignees?:    number[];
+    dependsOnTaskIds?: number[];
     priority:        string;
     dueDate?:        string;
   }) => Promise<void>;
@@ -27,17 +32,34 @@ const INPUT = [
 
 const LABEL = 'block text-sm font-medium text-[var(--text-primary)] mb-1.5';
 
-export default function CreateTaskModal({ open, users, onClose, onSubmit }: CreateTaskModalProps) {
+export default function CreateTaskModal({
+  open, users, tasks = [], onClose, onSubmit,
+}: CreateTaskModalProps) {
   const [submitting, setSubmitting] = useState(false);
   const [assignedTo, setAssignedTo] = useState<number | ''>('');
+  const [coAssignees, setCoAssignees] = useState<number[]>([]);
+  const [dependsOn, setDependsOn] = useState<number[]>([]);
   const formRef = useRef<HTMLFormElement>(null);
+
+  const dependencyOptions = useMemo(
+    () => tasks.filter((t) => t.status !== 'done'),
+    [tasks],
+  );
 
   useEffect(() => {
     if (!open) {
       setAssignedTo('');
+      setCoAssignees([]);
+      setDependsOn([]);
       formRef.current?.reset();
     }
   }, [open]);
+
+  useEffect(() => {
+    if (typeof assignedTo === 'number') {
+      setCoAssignees((prev) => prev.filter((id) => id !== assignedTo));
+    }
+  }, [assignedTo]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -48,6 +70,8 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
       taskTitle:       (fd.get('title') as string).trim(),
       taskDescription: (fd.get('desc')  as string).trim(),
       assignedTo,
+      coAssignees:     coAssignees.length ? coAssignees : undefined,
+      dependsOnTaskIds: dependsOn.length ? dependsOn : undefined,
       priority:        fd.get('priority') as string,
       dueDate:         (fd.get('dueDate') as string) || undefined,
     };
@@ -57,6 +81,8 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
       await onSubmit(data);
       formRef.current?.reset();
       setAssignedTo('');
+      setCoAssignees([]);
+      setDependsOn([]);
       onClose();
     } catch {
       // Parent shows toast; keep the form open for correction.
@@ -65,11 +91,16 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
     }
   }
 
+  function toggleDependency(taskId: number) {
+    setDependsOn((prev) =>
+      prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId],
+    );
+  }
+
   return (
-    <Modal open={open} onClose={onClose} title="Create New Task" description="Assign and configure a task for your team.">
+    <Modal open={open} onClose={onClose} title="Create New Task" description="Assign a lead, optional co-assignees, and dependencies.">
       <form ref={formRef} onSubmit={handleSubmit} className="space-y-5">
 
-        {/* Title */}
         <div>
           <label htmlFor="ct-title" className={LABEL}>Task Title <span className="text-red-500">*</span></label>
           <input
@@ -79,7 +110,6 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
           />
         </div>
 
-        {/* Description */}
         <div>
           <label htmlFor="ct-desc" className={LABEL}>Description <span className="text-red-500">*</span></label>
           <textarea
@@ -90,10 +120,9 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
           />
         </div>
 
-        {/* Assign + Priority row */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <label htmlFor="ct-assign" className={LABEL}>Assign To <span className="text-red-500">*</span></label>
+            <label htmlFor="ct-assign" className={LABEL}>Primary lead <span className="text-red-500">*</span></label>
             <UserSelect
               id="ct-assign"
               users={users}
@@ -114,7 +143,19 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
           </div>
         </div>
 
-        {/* Due date */}
+        <div>
+          <label className={LABEL}>
+            Co-assignees <span className="text-[var(--text-muted)] font-normal text-xs">(optional)</span>
+          </label>
+          <MultiUserSelect
+            users={users}
+            value={coAssignees}
+            onChange={setCoAssignees}
+            excludeIds={typeof assignedTo === 'number' ? [assignedTo] : []}
+            placeholder="Add supporting teammates…"
+          />
+        </div>
+
         <div>
           <label htmlFor="ct-due" className={LABEL}>Due Date <span className="text-[var(--text-muted)] font-normal text-xs">(optional)</span></label>
           <input
@@ -124,7 +165,40 @@ export default function CreateTaskModal({ open, users, onClose, onSubmit }: Crea
           />
         </div>
 
-        {/* Footer */}
+        {dependencyOptions.length > 0 && (
+          <div>
+            <label className={LABEL}>
+              Depends on <span className="text-[var(--text-muted)] font-normal text-xs">(optional — blocks Start until resolved)</span>
+            </label>
+            <div className="max-h-40 overflow-y-auto rounded-xl border border-[var(--border)] divide-y divide-[var(--border)]">
+              {dependencyOptions.map((t) => {
+                const checked = dependsOn.includes(t.taskId);
+                return (
+                  <label
+                    key={t.taskId}
+                    className="flex items-start gap-2.5 px-3 py-2 cursor-pointer hover:bg-[var(--surface-2)]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleDependency(t.taskId)}
+                      className="mt-1 accent-[var(--accent)]"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-[var(--text-primary)] truncate">
+                        #{t.taskId} {t.taskTitle}
+                      </span>
+                      <span className="block text-xs text-[var(--text-muted)] capitalize">
+                        {t.status.replace('_', ' ')}
+                      </span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         <div className="flex justify-end gap-3 pt-2">
           <button
             type="button" onClick={onClose}
