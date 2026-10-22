@@ -207,6 +207,18 @@ npm install
 npm run dev               # http://localhost:3000
 ```
 
+### 🔑 Testing Roles (Supervisor vs Employee)
+
+By default, new user sign-ups are assigned the **`employee`** role. 
+
+To test supervisor features (e.g., Supervisor Dashboard, approving/rejecting tasks, audit trail):
+
+1. **Option A (Demo Seed Data):** Run `psql -U tm -h localhost -d taskmanagement -f backend/src/main/resources/db/seed.sql` to populate demo tasks and supervisor/employee accounts.
+2. **Option B (Promote New User):** After signing up with your own account via the UI, elevate your role to supervisor in your local database:
+   ```sql
+   UPDATE app_users SET role = 'supervisor' WHERE email = 'your_email@example.com';
+   ```
+
 ---
 
 ## Testing
